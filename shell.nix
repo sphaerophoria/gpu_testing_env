@@ -14,7 +14,6 @@ in
       pkg-config
       ncurses.dev
       qemu
-      musl.dev
       file
       wget
       libxcrypt
