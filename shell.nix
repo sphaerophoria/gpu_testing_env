@@ -9,6 +9,8 @@ in
   name = "kernel-build-env";
   targetPkgs = pkgs: (with pkgs;
     [
+      unstable.zls
+      unstable.zig_0_13
       pkg-config
       ncurses.dev
       qemu

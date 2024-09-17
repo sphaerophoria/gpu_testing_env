@@ -42,6 +42,9 @@ linux: $(LINUX_SRC)
 	cp kernel_config build/linux/.config
 	$(MAKE) -C $< O=$(PWD)/build/linux -j9
 
-.PHONY: buildroot linux
+test_zig:
+	cd test_app/ && zig build -p ../overlay/usr/
+
+.PHONY: buildroot linux test_zig
 
 all: linux buildroot

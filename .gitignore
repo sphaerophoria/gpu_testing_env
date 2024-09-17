@@ -1,2 +1,4 @@
+/test_app/.zig-cache
+/test_app/zig-out
 /download
 /src
