@@ -6,7 +6,7 @@ const c = @cImport({
 
 fn getFirstConnectedConnector(f: std.fs.File, resources: *c.drmModeRes) ?*c.drmModeConnector {
     for (resources.connectors[0..@intCast(resources.count_connectors)]) |connector_id| {
-        const connector: *c.drmModeConnector = c.drmModeGetConnectorCurrent(f.handle, connector_id) orelse continue;
+        const connector: *c.drmModeConnector = c.drmModeGetConnector(f.handle, connector_id) orelse continue;
 
         if (connector.connection == c.DRM_MODE_CONNECTED) {
             return connector;
@@ -52,7 +52,7 @@ pub fn main() !void {
     var pitch: u32 = undefined;
     var size: u64 = undefined;
 
-    std.debug.print("{any}", .{preferred_mode});
+    std.debug.print("{any}\n", .{preferred_mode});
     if (c.drmModeCreateDumbBuffer(f.handle, preferred_mode.hdisplay, preferred_mode.vdisplay, 32, 0, &db_id, &pitch, &size) != 0) {
         return error.CreateDumbBuffer;
     }
@@ -107,7 +107,8 @@ pub fn main() !void {
             0x0
     );
 
-    _ = c.drmModeSetCrtc(f.handle, crtc.crtc_id, 0, 0, 0, null, 0, null);
-    _ = c.drmModeSetCrtc(f.handle, crtc.crtc_id, fb_id, 0, 0, &connector.connector_id, 1, preferred_mode);
-    std.time.sleep(1 * std.time.ns_per_s);
+    if (c.drmModeSetCrtc(f.handle, crtc.crtc_id, fb_id, 0, 0, &connector.connector_id, 1, preferred_mode) != 0) {
+        return error.SetCrtc;
+    }
+    std.time.sleep(5 * std.time.ns_per_s);
 }
