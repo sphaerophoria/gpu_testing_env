@@ -11,6 +11,10 @@ BUILDROOT_VERSION := 2024.08
 BUILDROOT_TARBALL := download/buildroot-$(BUILDROOT_VERSION).tar.gz
 BUILDROOT_SRC := src/buildroot-$(BUILDROOT_VERSION)
 
+QEMU_VERSION := 9.1.0
+QEMU_TARBALL := download/qemu-$(BUILDROOT_VERSION).tar.gz
+QEMU_SRC := src/qemu-$(QEMU_VERSION)
+
 define do_download
 	curl -L -o $@ $(1)
 endef
@@ -26,10 +30,16 @@ $(LINUX_TARBALL): download
 $(BUILDROOT_TARBALL): download
 	$(call do_download,https://www.buildroot.org/downloads/buildroot-$(BUILDROOT_VERSION).tar.gz)
 
+$(QEMU_TARBALL): download
+	$(call do_download,https://download.qemu.org/qemu-9.1.0.tar.xz)
+
 $(BUILDROOT_SRC): $(BUILDROOT_TARBALL)
 	$(call do_extract)
 
 $(LINUX_SRC): $(LINUX_TARBALL)
+	$(call do_extract)
+
+$(QEMU_SRC): $(QEMU_TARBALL)
 	$(call do_extract)
 
 buildroot: $(BUILDROOT_SRC)
@@ -41,6 +51,9 @@ linux: $(LINUX_SRC)
 	mkdir -p build/linux
 	cp kernel_config build/linux/.config
 	$(MAKE) -C $< O=$(PWD)/build/linux -j9
+
+qemu: $(QEMU_SRC)
+	mkdir -p build/qemu
 
 test_zig:
 	cd test_app/ && zig build -p ../overlay/usr/
