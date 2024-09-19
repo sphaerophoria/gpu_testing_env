@@ -15,6 +15,8 @@ QEMU_VERSION := 9.1.0
 QEMU_TARBALL := download/qemu-$(BUILDROOT_VERSION).tar.gz
 QEMU_SRC := src/qemu-$(QEMU_VERSION)
 
+CURDIR := $(PWD)
+
 define do_download
 	curl -L -o $@ $(1)
 endef
@@ -38,9 +40,11 @@ $(BUILDROOT_SRC): $(BUILDROOT_TARBALL)
 
 $(LINUX_SRC): $(LINUX_TARBALL)
 	$(call do_extract)
+	cd $@ && patch -p1 < $(CURDIR)/patch/linux/0001-Proof-of-concept-PCI-led-device.patch
 
 $(QEMU_SRC): $(QEMU_TARBALL)
 	$(call do_extract)
+	cd $@ && patch -p1 < $(CURDIR)/patch/qemu/0001-Proof-of-concept-pci-device.patch
 
 buildroot: $(BUILDROOT_SRC)
 	mkdir -p build/buildroot
