@@ -1,0 +1,367 @@
+From 65eb85af3ef2a0b6145c965b53777b1b420d640d Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Sat, 5 Oct 2024 18:44:23 +0000
+Subject: [PATCH] Implement naive 3d acceleration
+
+GPU now provides a very basic fixed function pipeline. It can render a
+single object with a single model transform with a single texture. Add
+the appropriate ioctls to interact with these new features
+
+Implementation details:
+* Write pattern looks similar to the framebuffer upload in some ways,
+  common code has been pulled out
+* GPU expects that for some uploads we tell it the size in advance, this
+  is because it needs to do some of its own memory management
+* PCI bar size had to increase for the new register write APIs
+---
+ drivers/gpu/drm/sphaero/sphaero_drv.c | 182 +++++++++++++++++++++-----
+ include/uapi/drm/sphaero_drm.h        |  61 +++++++++
+ 2 files changed, 211 insertions(+), 32 deletions(-)
+ create mode 100644 include/uapi/drm/sphaero_drm.h
+
+diff --git a/drivers/gpu/drm/sphaero/sphaero_drv.c b/drivers/gpu/drm/sphaero/sphaero_drv.c
+index e9155a9a9..2c97e2498 100644
+--- a/drivers/gpu/drm/sphaero/sphaero_drv.c
++++ b/drivers/gpu/drm/sphaero/sphaero_drv.c
+@@ -15,8 +15,11 @@
+ #include <drm/drm_damage_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_simple_kms_helper.h>
+ #include <drm/drm_managed.h>
++#include <drm/drm_ioctl.h>
++
++#include <uapi/drm/sphaero_drm.h>
+ 
+ static const struct drm_driver driver;
+ 
+ #define DRV_NAME		"sphaero-2"
+@@ -29,8 +32,21 @@ static const struct drm_driver driver;
+ #define SPHAERO_REG_FB_ADDR_HIGH 2
+ #define SPHAERO_REG_FB_SIZE_LOW 3
+ #define SPHAERO_REG_FB_SIZE_HIGH 4
+ #define SPHAERO_REG_FB_COMMIT_FRAME 5
++#define SPHAERO_REG_VB_ADDR_LOW 6
++#define SPHAERO_REG_VB_ADDR_HIGH 7
++#define SPHAERO_REG_VB_SIZE_LOW 8
++#define SPHAERO_REG_VB_SIZE_HIGH 9
++#define SPHAERO_REG_TEXTURE_ADDR_LOW 10
++#define SPHAERO_REG_TEXTURE_ADDR_HIGH 11
++#define SPHAERO_REG_TEXTURE_SIZE_LOW 12
++#define SPHAERO_REG_TEXTURE_SIZE_HIGH 13
++#define SPHAERO_REG_MODEL_TRANSFORM_ADDR_LOW 14
++#define SPHAERO_REG_MODEL_TRANSFORM_ADDR_HIGH 15
++
++
++#define DRM_SPHAERO_NUM_IOCTLS 5
+ 
+ static const struct pci_device_id pci_table[] = {
+         { PCI_DEVICE(PCI_VENDOR_ID_SPHAERO,     PCI_DEVICE_ID_SPHAERO), },
+         { },
+@@ -106,26 +122,15 @@ static const struct drm_mode_config_funcs sphaero_drv_mode_funcs = {
+ 	.atomic_check = drm_atomic_helper_check,
+ 	.atomic_commit = drm_atomic_helper_commit,
+ };
+ 
+-static int sphaero_gpu_dumb_create(struct drm_file *file_priv,
+-		   struct drm_device *dev,
+-		   struct drm_mode_create_dumb *args) {
+-
+-	int rc = 0;
+-	if (args->bpp != SPHAERO_SUPPORTED_BITS_PER_PIX) {
+-		return -EINVAL;
+-	}
+-
+-	args->pitch = args-> width * SPHAERO_BYTES_PER_PIX;
+-	args->size = args->pitch * args->height;
+-
+-	struct drm_gem_shmem_object *shmem_obj = drm_gem_shmem_create(dev, args->size);
++static int sphaero_create_gem_shmem(struct drm_device* dev, struct drm_file* file_priv, size_t size, uint32_t* handle) {
++	struct drm_gem_shmem_object *shmem_obj = drm_gem_shmem_create(dev, size);
+ 	if (IS_ERR(shmem_obj)) {
+ 		return PTR_ERR(shmem_obj);
+ 	}
+ 
+-	rc = drm_gem_handle_create(file_priv, &shmem_obj->base, &args->handle);
++	int rc = drm_gem_handle_create(file_priv, &shmem_obj->base, handle);
+ 
+ 	// Both error and non-error path have to release their reference
+ 	// to the created object, the handle owns it now. If the handle failed
+ 	// to create, then the object should get freed anyways... I think,
+@@ -133,49 +138,79 @@ static int sphaero_gpu_dumb_create(struct drm_file *file_priv,
+ 	drm_gem_object_put(&shmem_obj->base);
+ 	return rc;
+ }
+ 
++static int sphaero_gpu_dumb_create(struct drm_file *file_priv,
++		   struct drm_device *dev,
++		   struct drm_mode_create_dumb *args) {
++	if (args->bpp != SPHAERO_SUPPORTED_BITS_PER_PIX) {
++		return -EINVAL;
++	}
++
++	args->pitch = args-> width * SPHAERO_BYTES_PER_PIX;
++	args->size = args->pitch * args->height;
++
++	return sphaero_create_gem_shmem(dev, file_priv, args->size, &args->handle);
++}
++
+ static const struct drm_plane_funcs sphaero_gpu_plane_funcs = {
+ 	.update_plane		= drm_atomic_helper_update_plane,
+ 	.disable_plane		= drm_atomic_helper_disable_plane,
+ 	.reset			= drm_atomic_helper_plane_reset,
+ 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+ 	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
+ };
+ 
+-static void sphaero_gpu_plane_update(struct drm_plane *plane,
+-		      struct drm_atomic_state *state) {
+-
+-	struct drm_device* drm_dev = plane->dev;
+-	struct sphaero_priv* priv = drm_dev->dev_private;
+-
+-	if (plane == NULL || plane->state == NULL || plane->state->fb == NULL) {
+-		// FIXME: Should blank out screen or something
+-		return;
+-	}
+-
+-	struct drm_gem_object* gem_obj = plane->state->fb->obj[0];
++static int sphaero_do_gem_xfer(struct sphaero_priv* priv, struct drm_gem_object* gem_obj, uint32_t base_reg, bool with_chunk_len) {
+ 	struct drm_gem_shmem_object* shmem_obj = container_of(gem_obj, struct drm_gem_shmem_object, base);
+ 	// It seems like we are leaking a locked resource here, and we kinda
+ 	// are, however the table is held as a member of shmem_obj and re-used
+ 	// on future mappings. It seems like the model here is that if we are
+ 	// mapping a gem for DMA, it should stay mapped for the lifetime of
+ 	// the gem handle. It will get unmapped when the object is freed
+ 	struct sg_table* sg_table = drm_gem_shmem_get_pages_sgt(shmem_obj);
+ 	if (IS_ERR(sg_table)) {
+-		return;
++		return PTR_ERR(sg_table);
+ 	}
+ 
+ 	struct scatterlist *sg;
+ 	int si;
+ 	for_each_sgtable_dma_sg(sg_table, sg, si) {
+ 		u64 dma_addr = sg_dma_address(sg);
+ 		u64 dma_length = sg_dma_len(sg);
+-		priv->regs[SPHAERO_REG_FB_ADDR_LOW]  = cpu_to_le32(dma_addr);
+-		priv->regs[SPHAERO_REG_FB_ADDR_HIGH] = cpu_to_le32(dma_addr >> 32);
+-		priv->regs[SPHAERO_REG_FB_SIZE_LOW]  = cpu_to_le32(dma_length);
+-		priv->regs[SPHAERO_REG_FB_SIZE_HIGH] = cpu_to_le32(dma_length >> 32);
++		priv->regs[base_reg]  = cpu_to_le32(dma_addr);
++		priv->regs[base_reg + 1] = cpu_to_le32(dma_addr >> 32);
++		if (with_chunk_len) {
++			priv->regs[base_reg + 2]  = cpu_to_le32(dma_length);
++			priv->regs[base_reg + 3] = cpu_to_le32(dma_length >> 32);
++		}
+ 	}
++	return 0;
++}
++
++static int sphaero_do_size_prefixed_gem_xfer(struct sphaero_priv* priv, struct drm_gem_object* gem_obj, uint32_t base_reg, uint64_t size) {
++
++	priv->regs[base_reg]  = 0;
++	priv->regs[base_reg + 1] = 0;
++	priv->regs[base_reg + 2]  = size;
++	priv->regs[base_reg + 3] = size >> 32;
++
++	return sphaero_do_gem_xfer(priv, gem_obj, base_reg, true);
++}
++
++static void sphaero_gpu_plane_update(struct drm_plane *plane,
++		      struct drm_atomic_state *state) {
++
++	struct drm_device* drm_dev = plane->dev;
++	struct sphaero_priv* priv = drm_dev->dev_private;
++
++	if (plane == NULL || plane->state == NULL || plane->state->fb == NULL) {
++		// FIXME: Should blank out screen or something
++		return;
++	}
++
++	struct drm_gem_object* gem_obj = plane->state->fb->obj[0];
++	sphaero_do_gem_xfer(priv, gem_obj, SPHAERO_REG_FB_ADDR_LOW, true);
+ 	priv->regs[SPHAERO_REG_FB_COMMIT_FRAME] = 0;
+ }
+ 
+ static const struct drm_plane_helper_funcs sphaero_gpu_primary_helper_funcs = {
+@@ -239,9 +274,9 @@ static int sphaero_pci_init(struct pci_dev *pdev, struct sphaero_priv* priv) {
+ 	}
+ 
+ 	resource_size_t pciaddr = pci_resource_start(pdev, 0);
+ 
+-	priv->regs = ioremap(pciaddr, 32);
++	priv->regs = ioremap(pciaddr, 128);
+ 	return rc;
+ }
+ 
+ static void sphaero_pci_deinit(struct pci_dev *pdev) {
+@@ -344,8 +379,88 @@ static struct pci_driver sphaero_driver = {
+ module_pci_driver(sphaero_driver);
+ 
+ DEFINE_DRM_GEM_FOPS(sphaero_gpu_fops);
+ 
++static int sphaero_gpu_create_gpu_obj_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file) {
++	struct drm_sphaero_create_gpu_obj *params = data;
++	return sphaero_create_gem_shmem(dev, file, params->size, &params->handle);
++}
++
++static int sphaero_gpu_map_gpu_obj_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file) {
++	struct drm_sphaero_map_gpu_obj *params = data;
++
++	struct drm_gem_object *gobj = drm_gem_object_lookup(file, params->handle);
++	if (gobj == NULL)
++		return -ENOENT;
++
++	params->offset = drm_vma_node_offset_addr(&gobj->vma_node);
++	drm_gem_object_put(gobj);
++	return 0;
++}
++
++static int sphaero_gpu_upload_ioctl_sized(struct drm_device *dev, void *data,
++				struct drm_file *file, uint32_t base_reg) {
++	struct drm_sphaero_upload_gpu_obj *params = data;
++	struct sphaero_priv* priv = dev->dev_private;
++	struct drm_gem_object *gobj = drm_gem_object_lookup(file, params->handle);
++	if (!gobj) {
++		return -ENOENT;
++	}
++
++	int rc = sphaero_do_size_prefixed_gem_xfer(priv, gobj, base_reg, params->size);
++	drm_gem_object_put(gobj);
++	return rc;
++}
++
++static int sphaero_gpu_upload_ioctl_unsized(struct drm_device *dev, void *data,
++				struct drm_file *file, uint32_t base_reg) {
++	struct drm_sphaero_upload_gpu_obj *params = data;
++	struct sphaero_priv* priv = dev->dev_private;
++	struct drm_gem_object *gobj = drm_gem_object_lookup(file, params->handle);
++	if (!gobj) {
++		return -ENOENT;
++	}
++
++	int rc = sphaero_do_gem_xfer(priv, gobj, base_reg, false);
++	drm_gem_object_put(gobj);
++	return rc;
++}
++
++static int sphaero_gpu_upload_vb_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file) {
++	return sphaero_gpu_upload_ioctl_sized(dev, data, file, SPHAERO_REG_VB_ADDR_LOW);
++}
++
++static int sphaero_gpu_upload_texture_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file) {
++	return sphaero_gpu_upload_ioctl_sized(dev, data, file, SPHAERO_REG_TEXTURE_ADDR_LOW);
++}
++
++static int sphaero_gpu_upload_transform_ioctl(struct drm_device *dev, void *data,
++                               struct drm_file *file) {
++       struct drm_sphaero_upload_gpu_obj *params = data;
++       if (params->size != 16 * 4) {
++	       return -EINVAL;
++       }
++
++       return sphaero_gpu_upload_ioctl_unsized(dev, data, file, SPHAERO_REG_MODEL_TRANSFORM_ADDR_LOW);
++}
++
++
++struct drm_ioctl_desc sphaero_gpu_ioctls[DRM_SPHAERO_NUM_IOCTLS] = {
++	DRM_IOCTL_DEF_DRV(SPHAERO_CREATE_GPU_OBJ, sphaero_gpu_create_gpu_obj_ioctl,
++			  DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(SPHAERO_MAP_GPU_OBJ, sphaero_gpu_map_gpu_obj_ioctl,
++			  DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(SPHAERO_UPLOAD_VB, sphaero_gpu_upload_vb_ioctl,
++			  DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(SPHAERO_UPLOAD_TEXTURE, sphaero_gpu_upload_texture_ioctl,
++			  DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(SPHAERO_UPLOAD_TRANSFORM, sphaero_gpu_upload_transform_ioctl,
++			  DRM_RENDER_ALLOW),
++};
+ static const struct drm_driver driver = {
+ 	/*
+ 	 * If KMS is disabled DRIVER_MODESET and DRIVER_ATOMIC are masked
+ 	 * out via drm_device::driver_features:
+@@ -355,7 +470,10 @@ static const struct drm_driver driver = {
+ 	.name = "sphaero_gpu",
+ 	.dumb_create = sphaero_gpu_dumb_create,
+ 	.desc = "Sphaerophoria's testing gpu",
+ 	.fops = &sphaero_gpu_fops,
++
++	.ioctls = sphaero_gpu_ioctls,
++	.num_ioctls = DRM_SPHAERO_NUM_IOCTLS,
+ };
+ 
+ MODULE_LICENSE("GPL");
+diff --git a/include/uapi/drm/sphaero_drm.h b/include/uapi/drm/sphaero_drm.h
+new file mode 100644
+index 000000000..7501b46ee
+--- /dev/null
++++ b/include/uapi/drm/sphaero_drm.h
+@@ -0,0 +1,61 @@
++#ifndef SPHAERO_DRM_H
++#define SPHAERO_DRM_H
++
++#include "drm.h"
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++#define DRM_SPHAERO_CREATE_GPU_OBJ  0x00
++#define DRM_SPHAERO_MAP_GPU_OBJ  0x01
++#define DRM_SPHAERO_UPLOAD_VB  0x02
++#define DRM_SPHAERO_UPLOAD_TEXTURE  0x03
++#define DRM_SPHAERO_UPLOAD_TRANSFORM  0x04
++
++struct drm_sphaero_create_gpu_obj {
++	// inputs
++	__u64 size;
++
++	// outputs
++	__u32 handle;
++};
++
++struct drm_sphaero_map_gpu_obj {
++	// inputs
++	__u32 handle;
++
++	// outputs
++	__u64 offset;
++};
++
++struct drm_sphaero_upload_gpu_obj {
++	__u64 size;
++	__u32 handle;
++};
++
++#define DRM_IOCTL_SPHAERO_CREATE_GPU_OBJ \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_SPHAERO_CREATE_GPU_OBJ,\
++		struct drm_sphaero_create_gpu_obj)
++
++#define DRM_IOCTL_SPHAERO_MAP_GPU_OBJ \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_SPHAERO_MAP_GPU_OBJ,\
++		struct drm_sphaero_map_gpu_obj)
++
++#define DRM_IOCTL_SPHAERO_UPLOAD_VB \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_SPHAERO_UPLOAD_VB,\
++		struct drm_sphaero_upload_gpu_obj)
++
++#define DRM_IOCTL_SPHAERO_UPLOAD_TEXTURE \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_SPHAERO_UPLOAD_TEXTURE,\
++		struct drm_sphaero_upload_gpu_obj)
++
++#define DRM_IOCTL_SPHAERO_UPLOAD_TRANSFORM \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_SPHAERO_UPLOAD_TRANSFORM,\
++		struct drm_sphaero_upload_gpu_obj)
++
++#if defined(__cplusplus)
++}
++#endif
++
++#endif //SPHAERO_DRM_H
+-- 
+2.44.1
+

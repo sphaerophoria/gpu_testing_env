@@ -1,0 +1,533 @@
+From 8be018d58122abd0ea40bc718dc445c0ba55e210 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Sat, 5 Oct 2024 12:16:14 -0700
+Subject: [PATCH] Implement naive fixed function 3d pipeline
+
+Implement a renderer via opengl that renders a single model, with a
+single transform, and a single texture. Actual implementation dispatches
+to OpenGL (for now).
+
+Implementation details:
+* New components come in two forms
+  * Size prefixed registers. These need a size written with address of 0
+    to pre-allocate the dest buffer
+  * Fixed size registers. These act like the framebuffer upload
+* SphaeroFrameBuffer has been migrated to generic type that holds
+  capacity as well. This fits with other transfers easily
+* SphaeroPushBuffer push function now consumes pages that have data but
+  are larger than capacity. This will now consume as much as possible
+  * This was needed because sometimes the page transferred has garbage
+    data past the end of the desired transfer (e.g. round up for page
+    alignment)
+* OpenGL context initialized and used in gfx callback
+  * Context needs to be lazily initialized because context is not
+    available on realize
+  * SphaeroGraphics introduced to collect 1 time init stuff
+* sphaero_do_dma now needs to feed more than one SphaeroPushBuf, updated
+  to use callbacks for the actual copy
+---
+ hw/misc/sphaero.c | 389 ++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 363 insertions(+), 26 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index 26e4d1694..56ec6b1b8 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -4,37 +4,205 @@
+ 
+ #define TYPE_SPHAERO "sphaero"
+ OBJECT_DECLARE_SIMPLE_TYPE(SphaeroState, SPHAERO)
+ 
+-#define NUM_PIXELS (1024 * 768)
++#define SPHAERO_OUTPUT_WIDTH 1024
++#define SPHAERO_OUTPUT_HEIGHT 768
++#define NUM_PIXELS (SPHAERO_OUTPUT_WIDTH * SPHAERO_OUTPUT_HEIGHT)
+ #define PIXELS_SIZE (NUM_PIXELS * 4)
+ 
+ // NOTE: 0 is not reserved, just was used in testing and never fixed
+ #define SPHAERO_REG_FB_ADDR_LOW 1
+ #define SPHAERO_REG_FB_ADDR_HIGH 2
+ #define SPHAERO_REG_FB_SIZE_LOW 3
+ #define SPHAERO_REG_FB_SIZE_HIGH 4
+ #define SPHAERO_REG_FB_COMMIT_FRAME 5
+-
+-typedef struct SphaeroPixelBuf {
+-    void* pixels;
++#define SPHAERO_REG_VB_ADDR_LOW 6
++#define SPHAERO_REG_VB_ADDR_HIGH 7
++#define SPHAERO_REG_VB_SIZE_LOW 8
++#define SPHAERO_REG_VB_SIZE_HIGH 9
++#define SPHAERO_REG_TEXTURE_ADDR_LOW 10
++#define SPHAERO_REG_TEXTURE_ADDR_HIGH 11
++#define SPHAERO_REG_TEXTURE_SIZE_LOW 12
++#define SPHAERO_REG_TEXTURE_SIZE_HIGH 13
++#define SPHAERO_REG_MODEL_TRANSFORM_ADDR_LOW 14
++#define SPHAERO_REG_MODEL_TRANSFORM_ADDR_HIGH 15
++
++#define SPHAERO_TRANSFORM_SIZE (16 * sizeof(float))
++
++typedef struct SphaeroPushBuf {
++    void* data;
+     size_t len;
+-} SphaeroPixelBuf;
++    size_t capacity;
++} SphaeroPushBuf;
+ 
+-static SphaeroPixelBuf sphaero_pixel_buf_create(void) {
+-    SphaeroPixelBuf ret = {
+-        .pixels = malloc(PIXELS_SIZE),
++static SphaeroPushBuf sphaero_push_buf_create(size_t size) {
++    SphaeroPushBuf ret = {
++        .data = malloc(size),
+         .len = 0,
++        .capacity = size,
+     };
+-    memset(ret.pixels, 0, PIXELS_SIZE);
++    memset(ret.data, 0, size);
++    return ret;
++}
++
++static SphaeroPushBuf sphaero_pixel_buf_create(void) {
++    return sphaero_push_buf_create(PIXELS_SIZE);
++}
++
++#define min(a, b) (a) < (b) ? (a) : (b)
++
++static void sphaero_push_buf_push_data(SphaeroPushBuf* buf, void* data, size_t len) {
++    size_t copy_len = min(len, buf->capacity - buf->len);
++    memcpy(buf->data + buf->len, data, copy_len);
++    buf->len += copy_len;
++}
++
++static bool sphaero_push_buf_complete(SphaeroPushBuf* buf) {
++    return buf->len != 0 && buf->len == buf->capacity;
++}
++
++static void sphaero_push_buf_free(SphaeroPushBuf* buf) {
++    free(buf->data);
++}
++
++static void sphaero_push_buf_push_data_cb(void* buf, void* data, size_t len) {
++    sphaero_push_buf_push_data(buf, data, len);
++}
++
++static void memcpy_cb(void* buf, void* data, size_t len) {
++    memcpy(buf, data, len);
++}
++
++typedef struct SphaeroGraphics {
++    bool initialized;
++    GLuint output_texture;
++    GLuint depth_texture;
++    GLuint input_texture;
++    GLuint vao;
++    GLuint vbo;
++    GLuint num_verts;
++    GLuint program;
++    GLuint transform_loc;
++} SphaeroGraphics;
++
++
++// Vertex shader source code
++const char* vertexShaderSource = "#version 330 core \n\
++layout(location = 0) in vec3 vert; \n\
++layout(location = 1) in vec2 uv; \n\
++uniform mat4 transform;\n\
++out vec2 frag_uv; \n\
++void main() \n\
++{ \n\
++    gl_Position = transform * vec4(vert, 1.0); \n\
++    frag_uv = uv; \n\
++}";
++
++// Fragment shader source code
++const char* fragmentShaderSource = "#version 330 core \n\
++out vec4 FragColor; \n\
++in vec2 frag_uv; \n\
++uniform sampler2D tex;\n\
++void main() \n\
++{ \n\
++    FragColor = texture(tex, frag_uv);\n\
++}";
++
++static GLuint sphaero_generate_bind_texture(void) {
++    GLuint ret;
++    glGenTextures(1, &ret);
++    glBindTexture(GL_TEXTURE_2D, ret);
++
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++
+     return ret;
+ }
+ 
+-static void sphaero_pixel_buf_push_data(SphaeroPixelBuf* buf, void* data, size_t len) {
+-    if (buf->len + len <= PIXELS_SIZE) {
+-        memcpy(buf->pixels + buf->len, data, len);
+-        buf->len += len;
++typedef struct SphaeroGlBufParams {
++    GLuint vao;
++    GLuint vbo;
++} SphaeroGlBufParams;
++
++static SphaeroGlBufParams sphaero_prepare_vao(SphaeroPushBuf* vb) {
++    SphaeroGlBufParams ret;
++    glGenVertexArrays(1, &ret.vao);
++    glBindVertexArray(ret.vao);
++
++    glGenBuffers(1, &ret.vbo);
++    glBindBuffer(GL_ARRAY_BUFFER, ret.vbo);
++    glBufferData(GL_ARRAY_BUFFER, vb->len, vb->data, GL_STATIC_DRAW);
++
++    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
++    glEnableVertexAttribArray(0);
++
++    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
++    glEnableVertexAttribArray(1);
++    return ret;
++}
++
++static GLuint sphaero_make_gl_program(void) {
++    GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
++    glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
++    glCompileShader(vertexShader);
++    // FIXME: check shader compilation success
++
++    GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
++    glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
++    glCompileShader(fragmentShader);
++
++    GLuint program = glCreateProgram();
++    glAttachShader(program, vertexShader);
++    glAttachShader(program, fragmentShader);
++    glLinkProgram(program);
++
++    glDeleteShader(vertexShader);
++    glDeleteShader(fragmentShader);
++
++    return program;
++}
++
++static void sphaero_graphics_ensure_init(SphaeroGraphics* g, QemuConsole* console, SphaeroPushBuf* vb, SphaeroPushBuf* input_texture_data) {
++    if (g->initialized) {
++        return;
+     }
++
++    g->output_texture = sphaero_generate_bind_texture();
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SPHAERO_OUTPUT_WIDTH, SPHAERO_OUTPUT_HEIGHT, 0, GL_RGBA,
++            GL_UNSIGNED_BYTE, NULL);
++
++    g->depth_texture = sphaero_generate_bind_texture();
++    glTexImage2D(
++        GL_TEXTURE_2D,
++        0,
++        GL_DEPTH24_STENCIL8,
++        SPHAERO_OUTPUT_WIDTH,
++        SPHAERO_OUTPUT_HEIGHT,
++        0,
++        GL_DEPTH_STENCIL,
++        GL_UNSIGNED_INT_24_8,
++        NULL
++    );
++
++    g->input_texture = sphaero_generate_bind_texture();
++    // FIXME: 1024 x 1024 should come from the kernel driver
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1024, 1024, 0, GL_RGBA,
++            GL_UNSIGNED_BYTE, (void*)input_texture_data->data);
++
++
++    SphaeroGlBufParams gl_params = sphaero_prepare_vao(vb);
++    g->vao = gl_params.vao;
++    g->vbo = gl_params.vbo;
++    g->num_verts = vb->len / sizeof(float);
++
++    g->program = sphaero_make_gl_program();
++    g->transform_loc = glGetUniformLocation(g->program, "transform");
++    g->initialized = true;
++
++    glBindTexture(GL_TEXTURE_2D, 0);
++    glBindBuffer(GL_ARRAY_BUFFER, 0);
++    glBindVertexArray(0);
+ }
+ 
+ typedef struct SphaeroState
+ {
+@@ -47,17 +215,37 @@ typedef struct SphaeroState
+ 
+     uint64_t dma_address;
+     uint64_t dma_len;
+ 
+-    SphaeroPixelBuf pixels[2];
++    uint64_t vb_address;
++    uint64_t vb_len;
++
++    uint64_t texture_address;
++    uint64_t texture_len;
++
++    uint64_t transform_address;
++
++    struct SphaeroVbProtected {
++        QemuMutex lock;
++        SphaeroPushBuf vb;
++        SphaeroPushBuf texture;
++        float transform[16];
++    } render_protected;
++
++    SphaeroPushBuf pixels[2];
+     bool display_idx;
++
++    SphaeroGraphics graphics;
+ } SphaeroState;
+ 
+-static void sphaero_do_dma(SphaeroState* s) {
+-    uint64_t addr = s->dma_address;
+-    while (addr < s->dma_address + s->dma_len) {
++typedef void (*sphaero_dma_copy_fn)(void* context, void* data, size_t len);
++
++static void sphaero_do_dma(uint64_t in_addr, uint64_t in_len, sphaero_dma_copy_fn copy_fn, void* copy_context) {
+ 
+-        uint64_t len = s->dma_len - (addr - s->dma_address);
++    uint64_t addr = in_addr;
++    while (addr < in_addr + in_len) {
++        uint64_t written = addr - in_addr;
++        uint64_t len = in_len - written;
+         uint32_t* map = dma_memory_map(&address_space_memory, addr, &len,
+                              DMA_DIRECTION_TO_DEVICE,
+                              MEMTXATTRS_UNSPECIFIED);
+         addr += len;
+@@ -66,14 +254,15 @@ static void sphaero_do_dma(SphaeroState* s) {
+             printf("Mapped 0 bytes sadge\n");
+             break;
+         }
+ 
+-        sphaero_pixel_buf_push_data(&s->pixels[s->display_idx], map, len);
+-        dma_memory_unmap(s->as, map, len, DMA_DIRECTION_TO_DEVICE, len);
++        copy_fn(copy_context, map, len);
++
++        dma_memory_unmap(&address_space_memory, map, len, DMA_DIRECTION_TO_DEVICE, len);
+     }
+ }
+ 
+-static SphaeroPixelBuf* sphaero_current_pixel_buf(SphaeroState* s) {
++static SphaeroPushBuf* sphaero_current_pixel_buf(SphaeroState* s) {
+     return &s->pixels[s->display_idx];
+ }
+ 
+ static void sphaero_swap_pixel_buf(SphaeroState* s) {
+@@ -81,9 +270,9 @@ static void sphaero_swap_pixel_buf(SphaeroState* s) {
+     sphaero_current_pixel_buf(s)->len = 0;
+ }
+ 
+ static void sphaero_commit_frame(SphaeroState* s) {
+-    DisplaySurface* ds = qemu_create_displaysurface_from(1024, 768, PIXMAN_a8r8g8b8, 1024 * 4, sphaero_current_pixel_buf(s)->pixels);
++    DisplaySurface* ds = qemu_create_displaysurface_from(SPHAERO_OUTPUT_WIDTH, SPHAERO_OUTPUT_HEIGHT, PIXMAN_a8r8g8b8, SPHAERO_OUTPUT_WIDTH * 4, sphaero_current_pixel_buf(s)->data);
+     dpy_gfx_replace_surface(s->console, ds);
+     dpy_gfx_update_full(s->console);
+ 
+     sphaero_swap_pixel_buf(s);
+@@ -99,8 +288,20 @@ static void sphaero_replace_high(uint32_t in, uint64_t* out) {
+     uint64_t in_u64 = in;
+     *out |= in_u64 << 32;
+ }
+ 
++static void replace_low(uint32_t in, uint64_t* out) {
++    *out &= 0xffffffff00000000;
++    *out |= in;
++}
++
++static void replace_high(uint32_t in, uint64_t* out) {
++    *out &= 0x00000000ffffffff;
++    uint64_t in_u64 = in;
++    *out |= in_u64 << 32;
++}
++
++
+ static void sphaero_write(void *opaque,
+                   hwaddr addr,
+                   uint64_t data,
+                   unsigned size) {
+@@ -120,15 +321,88 @@ static void sphaero_write(void *opaque,
+             break;
+         }
+         case SPHAERO_REG_FB_SIZE_HIGH: {
+             sphaero_replace_high(data, &s->dma_len);
+-            sphaero_do_dma(s);
++            sphaero_do_dma(s->dma_address, s->dma_len, sphaero_push_buf_push_data_cb, &s->pixels[s->display_idx]);
+             break;
+         }
+         case SPHAERO_REG_FB_COMMIT_FRAME: {
+             sphaero_commit_frame(s);
+             break;
+         }
++        case SPHAERO_REG_VB_ADDR_LOW: {
++            replace_low(data, &s->vb_address);
++            break;
++        }
++        case SPHAERO_REG_VB_ADDR_HIGH: {
++            replace_high(data, &s->vb_address);
++            break;
++        }
++        case SPHAERO_REG_VB_SIZE_LOW: {
++            replace_low(data, &s->vb_len);
++            break;
++        }
++        case SPHAERO_REG_VB_SIZE_HIGH: {
++            replace_high(data, &s->vb_len);
++
++            if (s->vb_address == 0) {
++                qemu_mutex_lock(&s->render_protected.lock);
++
++                sphaero_push_buf_free(&s->render_protected.vb);
++                s->render_protected.vb = sphaero_push_buf_create(s->vb_len);
++
++                qemu_mutex_unlock(&s->render_protected.lock);
++
++                break;
++            }
++
++            qemu_mutex_lock(&s->render_protected.lock);
++            sphaero_do_dma(s->vb_address, s->vb_len, sphaero_push_buf_push_data_cb, &s->render_protected.vb);
++            qemu_mutex_unlock(&s->render_protected.lock);
++            break;
++        }
++        case SPHAERO_REG_TEXTURE_ADDR_LOW: {
++            replace_low(data, &s->texture_address);
++            break;
++        }
++        case SPHAERO_REG_TEXTURE_ADDR_HIGH: {
++            replace_high(data, &s->texture_address);
++            break;
++        }
++        case SPHAERO_REG_TEXTURE_SIZE_LOW: {
++            replace_low(data, &s->texture_len);
++            break;
++        }
++        case SPHAERO_REG_TEXTURE_SIZE_HIGH: {
++            replace_high(data, &s->texture_len);
++
++            if (s->texture_address == 0) {
++                qemu_mutex_lock(&s->render_protected.lock);
++
++                sphaero_push_buf_free(&s->render_protected.texture);
++                s->render_protected.texture = sphaero_push_buf_create(s->texture_len);
++
++                qemu_mutex_unlock(&s->render_protected.lock);
++
++                break;
++            }
++
++            qemu_mutex_lock(&s->render_protected.lock);
++
++            sphaero_do_dma(s->texture_address, s->texture_len, sphaero_push_buf_push_data_cb, &s->render_protected.texture);
++            qemu_mutex_unlock(&s->render_protected.lock);
++            break;
++        }
++        case SPHAERO_REG_MODEL_TRANSFORM_ADDR_LOW: {
++            replace_low(data, &s->transform_address);
++            break;
++        }
++        case SPHAERO_REG_MODEL_TRANSFORM_ADDR_HIGH: {
++            replace_high(data, &s->transform_address);
++            sphaero_do_dma(s->transform_address, SPHAERO_TRANSFORM_SIZE, memcpy_cb, s->render_protected.transform);
++            break;
++        }
++
+         default: break;
+     }
+ }
+ 
+@@ -143,25 +417,88 @@ static const MemoryRegionOps sphaero_ops = {
+     .write = sphaero_write,
+     .read = sphaero_read,
+ };
+ 
+-static const GraphicHwOps sphaero_gpu_ops = {0};
++static int
++sphaero_gpu_get_flags(void *opaque)
++{
++    return GRAPHIC_FLAGS_GL;
++}
++
++
++static void sphaero_gpu_gfx_update(void *opaque) {
++    SphaeroState *s = opaque;
++
++    qemu_mutex_lock(&s->render_protected.lock);
++    if (!sphaero_push_buf_complete(&s->render_protected.vb) || !sphaero_push_buf_complete(&s->render_protected.texture)) {
++        qemu_mutex_unlock(&s->render_protected.lock);
++        return;
++    } else {
++        // FIXME: This qemu resize we believe only affects sw rendered buffers, can probably remove
++        qemu_console_resize(s->console, SPHAERO_OUTPUT_WIDTH, SPHAERO_OUTPUT_HEIGHT);
++        sphaero_graphics_ensure_init(&s->graphics, s->console, &s->render_protected.vb, &s->render_protected.texture);
++
++        qemu_mutex_unlock(&s->render_protected.lock);
++    }
++
++
++    dpy_gl_scanout_texture(s->console, s->graphics.output_texture, false, SPHAERO_OUTPUT_WIDTH, SPHAERO_OUTPUT_HEIGHT, 0, 0, SPHAERO_OUTPUT_WIDTH, SPHAERO_OUTPUT_HEIGHT, NULL);
++    // dpy_gl_scanout_texture sets up a color framebuffer for use to use,
++    // however it does not provide a depth buffer. For us to do 3d rendering we
++    // need a depth buffer
++    glFramebufferTexture2D(
++        GL_FRAMEBUFFER,
++        GL_DEPTH_STENCIL_ATTACHMENT,
++        GL_TEXTURE_2D,
++        s->graphics.depth_texture,
++        0
++    );
++
++    // qemu seems to disable these between runs
++    glEnable(GL_DEPTH_TEST);
++    glDepthFunc(GL_LESS);
++
++    glViewport(0, 0, SPHAERO_OUTPUT_WIDTH, SPHAERO_OUTPUT_HEIGHT);
++    glClearColor(0.1, 0.1, 0.1, 1.0);
++    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++
++    glUseProgram(s->graphics.program);
++    glBindVertexArray(s->graphics.vao);
++
++    qemu_mutex_lock(&s->render_protected.lock);
++    glUniformMatrix4fv(s->graphics.transform_loc, 1, 1, s->render_protected.transform);
++    qemu_mutex_unlock(&s->render_protected.lock);
++
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, s->graphics.input_texture);
++
++    glDrawArrays(GL_TRIANGLES, 0, s->graphics.num_verts);
++
++    dpy_gl_update(s->console, 0, 0, SPHAERO_OUTPUT_WIDTH, SPHAERO_OUTPUT_HEIGHT);
++}
++
++static const GraphicHwOps sphaero_gpu_ops = {
++    .get_flags = sphaero_gpu_get_flags,
++    .gfx_update = sphaero_gpu_gfx_update,
++};
+ 
+ static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
+ {
+     SphaeroState *s = SPHAERO(dev);
+ 
+     memory_region_init_io(&s->bar, OBJECT(s), &sphaero_ops, s,
+-                          "sphaero", 32);
++                          "sphaero", 128);
+ 
+     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
+ 
+     s->as = pci_get_address_space(dev);
+     s->display_idx = false;
+     s->pixels[0] = sphaero_pixel_buf_create();
+     s->pixels[1] = sphaero_pixel_buf_create();
+     s->console = graphic_console_init(DEVICE(dev), 0, &sphaero_gpu_ops, s);
+-
++    s->render_protected.vb = (struct SphaeroPushBuf){0};
++    qemu_mutex_init(&s->render_protected.lock);
++    s->graphics = (SphaeroGraphics){0};
+ }
+ 
+ static void sphaero_class_init(ObjectClass *klass, void *data)
+ {
+-- 
+2.44.1
+
