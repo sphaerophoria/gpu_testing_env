@@ -1,0 +1,251 @@
+From 231dc0c14b8c140a31eccb8e7b8fe74e5fd12afe Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Wed, 18 Sep 2024 21:35:47 -0700
+Subject: [PATCH] Proof of concept GPU
+
+Take pixels from a guest OS, and display them in a qemu console.
+
+* Pixels are pushed in segments into our PCI registers
+* Copy is performed when the second half of length is set
+* Registers are uint32_t arbitrarily, probably overcomplicated compared
+  to if we set them as uint64_t, but here we are
+---
+ hw/misc/Kconfig     |   5 ++
+ hw/misc/meson.build |   1 +
+ hw/misc/sphaero.c   | 192 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 198 insertions(+)
+ create mode 100644 hw/misc/sphaero.c
+
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index 1e08785b8..a20f37ad7 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -71,8 +71,13 @@ config IVSHMEM_DEVICE
+     bool
+     default y if PCI_DEVICES
+     depends on PCI && LINUX && IVSHMEM && MSI_NONBROKEN
+ 
++config SPHAERO_DEVICE
++    bool
++    default y if PCI_DEVICES
++    depends on PCI
++
+ config ECCMEMCTL
+     bool
+     select ECC
+ 
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 2ca8717be..956f1a0f1 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -37,8 +37,9 @@ system_ss.add(when: 'CONFIG_SIFIVE_U_PRCI', if_true: files('sifive_u_prci.c'))
+ 
+ subdir('macio')
+ 
+ system_ss.add(when: 'CONFIG_IVSHMEM_DEVICE', if_true: files('ivshmem.c'))
++system_ss.add(when: 'CONFIG_SPHAERO_DEVICE', if_true: files('sphaero.c'))
+ 
+ system_ss.add(when: 'CONFIG_ALLWINNER_SRAMC', if_true: files('allwinner-sramc.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_A10_CCM', if_true: files('allwinner-a10-ccm.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_A10_DRAMC', if_true: files('allwinner-a10-dramc.c'))
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+new file mode 100644
+index 000000000..26e4d1694
+--- /dev/null
++++ b/hw/misc/sphaero.c
+@@ -0,0 +1,192 @@
++#include "qemu/osdep.h"
++#include "ui/console.h"
++#include "hw/pci/pci_device.h"
++
++#define TYPE_SPHAERO "sphaero"
++OBJECT_DECLARE_SIMPLE_TYPE(SphaeroState, SPHAERO)
++
++#define NUM_PIXELS (1024 * 768)
++#define PIXELS_SIZE (NUM_PIXELS * 4)
++
++// NOTE: 0 is not reserved, just was used in testing and never fixed
++#define SPHAERO_REG_FB_ADDR_LOW 1
++#define SPHAERO_REG_FB_ADDR_HIGH 2
++#define SPHAERO_REG_FB_SIZE_LOW 3
++#define SPHAERO_REG_FB_SIZE_HIGH 4
++#define SPHAERO_REG_FB_COMMIT_FRAME 5
++
++typedef struct SphaeroPixelBuf {
++    void* pixels;
++    size_t len;
++} SphaeroPixelBuf;
++
++static SphaeroPixelBuf sphaero_pixel_buf_create(void) {
++    SphaeroPixelBuf ret = {
++        .pixels = malloc(PIXELS_SIZE),
++        .len = 0,
++    };
++    memset(ret.pixels, 0, PIXELS_SIZE);
++    return ret;
++}
++
++static void sphaero_pixel_buf_push_data(SphaeroPixelBuf* buf, void* data, size_t len) {
++    if (buf->len + len <= PIXELS_SIZE) {
++        memcpy(buf->pixels + buf->len, data, len);
++        buf->len += len;
++    }
++}
++
++typedef struct SphaeroState
++{
++    PCIDevice parent_obj;
++
++    AddressSpace* as;
++    MemoryRegion bar;
++
++    QemuConsole* console;
++
++    uint64_t dma_address;
++    uint64_t dma_len;
++
++    SphaeroPixelBuf pixels[2];
++    bool display_idx;
++} SphaeroState;
++
++static void sphaero_do_dma(SphaeroState* s) {
++    uint64_t addr = s->dma_address;
++    while (addr < s->dma_address + s->dma_len) {
++
++        uint64_t len = s->dma_len - (addr - s->dma_address);
++        uint32_t* map = dma_memory_map(&address_space_memory, addr, &len,
++                             DMA_DIRECTION_TO_DEVICE,
++                             MEMTXATTRS_UNSPECIFIED);
++        addr += len;
++
++        if (len == 0) {
++            printf("Mapped 0 bytes sadge\n");
++            break;
++        }
++
++        sphaero_pixel_buf_push_data(&s->pixels[s->display_idx], map, len);
++        dma_memory_unmap(s->as, map, len, DMA_DIRECTION_TO_DEVICE, len);
++    }
++}
++
++static SphaeroPixelBuf* sphaero_current_pixel_buf(SphaeroState* s) {
++    return &s->pixels[s->display_idx];
++}
++
++static void sphaero_swap_pixel_buf(SphaeroState* s) {
++    s->display_idx = !s->display_idx;
++    sphaero_current_pixel_buf(s)->len = 0;
++}
++
++static void sphaero_commit_frame(SphaeroState* s) {
++    DisplaySurface* ds = qemu_create_displaysurface_from(1024, 768, PIXMAN_a8r8g8b8, 1024 * 4, sphaero_current_pixel_buf(s)->pixels);
++    dpy_gfx_replace_surface(s->console, ds);
++    dpy_gfx_update_full(s->console);
++
++    sphaero_swap_pixel_buf(s);
++}
++
++static void sphaero_replace_low(uint32_t in, uint64_t* out) {
++    *out &= 0xffffffff00000000;
++    *out |= in;
++}
++
++static void sphaero_replace_high(uint32_t in, uint64_t* out) {
++    *out &= 0x00000000ffffffff;
++    uint64_t in_u64 = in;
++    *out |= in_u64 << 32;
++}
++
++static void sphaero_write(void *opaque,
++                  hwaddr addr,
++                  uint64_t data,
++                  unsigned size) {
++    SphaeroState* s = opaque;
++    hwaddr reg = addr / 4;
++    switch (reg) {
++        case SPHAERO_REG_FB_ADDR_LOW: {
++            sphaero_replace_low(data, &s->dma_address);
++            break;
++        }
++        case SPHAERO_REG_FB_ADDR_HIGH: {
++            sphaero_replace_high(data, &s->dma_address);
++            break;
++        }
++        case SPHAERO_REG_FB_SIZE_LOW: {
++            sphaero_replace_low(data, &s->dma_len);
++            break;
++        }
++        case SPHAERO_REG_FB_SIZE_HIGH: {
++            sphaero_replace_high(data, &s->dma_len);
++            sphaero_do_dma(s);
++            break;
++        }
++        case SPHAERO_REG_FB_COMMIT_FRAME: {
++            sphaero_commit_frame(s);
++            break;
++        }
++        default: break;
++    }
++}
++
++
++static uint64_t sphaero_read(void *opaque,
++                 hwaddr addr,
++                 unsigned size) {
++    return ~0;
++}
++
++static const MemoryRegionOps sphaero_ops = {
++    .write = sphaero_write,
++    .read = sphaero_read,
++};
++
++static const GraphicHwOps sphaero_gpu_ops = {0};
++
++static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
++{
++    SphaeroState *s = SPHAERO(dev);
++
++    memory_region_init_io(&s->bar, OBJECT(s), &sphaero_ops, s,
++                          "sphaero", 32);
++
++    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
++
++    s->as = pci_get_address_space(dev);
++    s->display_idx = false;
++    s->pixels[0] = sphaero_pixel_buf_create();
++    s->pixels[1] = sphaero_pixel_buf_create();
++    s->console = graphic_console_init(DEVICE(dev), 0, &sphaero_gpu_ops, s);
++
++}
++
++static void sphaero_class_init(ObjectClass *klass, void *data)
++{
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++
++    k->vendor_id = 0xaaaa;
++    k->device_id = 0xaaaa;
++    k->realize = pci_sphaero_realize;
++}
++
++static const TypeInfo sphaero_info = {
++   .name = TYPE_SPHAERO,
++   .parent = TYPE_PCI_DEVICE,
++   .instance_size = sizeof(SphaeroState),
++   .class_init    = sphaero_class_init,
++   .interfaces = (InterfaceInfo[]) {
++       { INTERFACE_CONVENTIONAL_PCI_DEVICE },
++       { },
++   },
++};
++
++static void my_device_register_types(void)
++{
++   type_register_static(&sphaero_info);
++}
++
++type_init(my_device_register_types)
++
+-- 
+2.44.1
+

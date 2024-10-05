@@ -1,0 +1,468 @@
+From fdbf8e29cc7e70dd01f5ab6d3abc84ba18bafc53 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Wed, 18 Sep 2024 21:36:05 -0700
+Subject: [PATCH] GPU driver proof of concept
+
+This implements a driver for a PCI GPU. It is modeled fairly heavily off
+virtio-gpu. Implemented functions are a response to crashes or incorrect
+behavior observed in a simple userspace test app
+
+In it's current form, it is able to run kmscube (slowly)
+---
+ drivers/gpu/drm/Kconfig               |   2 +
+ drivers/gpu/drm/Makefile              |   1 +
+ drivers/gpu/drm/drm_mode_config.c     |   6 +-
+ drivers/gpu/drm/sphaero/Kconfig       |   7 +
+ drivers/gpu/drm/sphaero/Makefile      |   8 +
+ drivers/gpu/drm/sphaero/sphaero_drv.c | 361 ++++++++++++++++++++++++++
+ 6 files changed, 384 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/sphaero/Kconfig
+ create mode 100644 drivers/gpu/drm/sphaero/Makefile
+ create mode 100644 drivers/gpu/drm/sphaero/sphaero_drv.c
+
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index 6b2c6b91f..8ef4c5d1d 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -369,8 +369,10 @@ source "drivers/gpu/drm/tilcdc/Kconfig"
+ source "drivers/gpu/drm/qxl/Kconfig"
+ 
+ source "drivers/gpu/drm/virtio/Kconfig"
+ 
++source "drivers/gpu/drm/sphaero/Kconfig"
++
+ source "drivers/gpu/drm/msm/Kconfig"
+ 
+ source "drivers/gpu/drm/fsl-dcu/Kconfig"
+ 
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index fa432a1ac..1fc474e49 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -183,8 +183,9 @@ obj-y			+= omapdrm/
+ obj-$(CONFIG_DRM_SUN4I) += sun4i/
+ obj-y			+= tilcdc/
+ obj-$(CONFIG_DRM_QXL) += qxl/
+ obj-$(CONFIG_DRM_VIRTIO_GPU) += virtio/
++obj-$(CONFIG_DRM_SPHAERO_GPU) += sphaero/
+ obj-$(CONFIG_DRM_MSM) += msm/
+ obj-$(CONFIG_DRM_TEGRA) += tegra/
+ obj-$(CONFIG_DRM_STM) += stm/
+ obj-$(CONFIG_DRM_STI) += sti/
+diff --git a/drivers/gpu/drm/drm_mode_config.c b/drivers/gpu/drm/drm_mode_config.c
+index 568972258..f38a97f63 100644
+--- a/drivers/gpu/drm/drm_mode_config.c
++++ b/drivers/gpu/drm/drm_mode_config.c
+@@ -646,10 +646,14 @@ void drm_mode_config_validate(struct drm_device *dev)
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
+ 		return;
+ 
+-	drm_for_each_encoder(encoder, dev)
++	printk("Before encoder iter\n");
++	drm_for_each_encoder(encoder, dev) {
++		printk("Looking at encoder %s\n", encoder->name);
+ 		fixup_encoder_possible_clones(encoder);
++	}
++	printk("After encoder iter\n");
+ 
+ 	drm_for_each_encoder(encoder, dev) {
+ 		validate_encoder_possible_clones(encoder);
+ 		validate_encoder_possible_crtcs(encoder);
+diff --git a/drivers/gpu/drm/sphaero/Kconfig b/drivers/gpu/drm/sphaero/Kconfig
+new file mode 100644
+index 000000000..a0a8ff762
+--- /dev/null
++++ b/drivers/gpu/drm/sphaero/Kconfig
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config DRM_SPHAERO_GPU
++	tristate "Sphaero GPU driver"
++	depends on DRM && MMU
++	select DRM_KMS_HELPER
++	select DRM_GEM_SHMEM_HELPER
++
+diff --git a/drivers/gpu/drm/sphaero/Makefile b/drivers/gpu/drm/sphaero/Makefile
+new file mode 100644
+index 000000000..7630dee4a
+--- /dev/null
++++ b/drivers/gpu/drm/sphaero/Makefile
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for the drm device driver.  This driver provides support for the
++# Direct Rendering Infrastructure (DRI) in XFree86 4.1.0 and higher.
++
++sphaero-gpu-y := sphaero_drv.o
++
++obj-$(CONFIG_DRM_SPHAERO_GPU) += sphaero-gpu.o
+diff --git a/drivers/gpu/drm/sphaero/sphaero_drv.c b/drivers/gpu/drm/sphaero/sphaero_drv.c
+new file mode 100644
+index 000000000..e9155a9a9
+--- /dev/null
++++ b/drivers/gpu/drm/sphaero/sphaero_drv.c
+@@ -0,0 +1,361 @@
++#include <linux/module.h>
++#include <linux/pci.h>
++
++#include <drm/drm.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_file.h>
++#include <drm/drm_ioctl.h>
++#include <drm/drm_atomic_state_helper.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_modeset_helper_vtables.h>
++#include <drm/drm_edid.h>
++#include <drm/drm_gem_shmem_helper.h>
++#include <drm/drm_modeset_helper.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_damage_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_simple_kms_helper.h>
++#include <drm/drm_managed.h>
++
++static const struct drm_driver driver;
++
++#define DRV_NAME		"sphaero-2"
++#define PCI_VENDOR_ID_SPHAERO	0xaaaa
++#define PCI_DEVICE_ID_SPHAERO	0xaaaa
++#define SPHAERO_SUPPORTED_BITS_PER_PIX 32
++#define SPHAERO_BYTES_PER_PIX (SPHAERO_SUPPORTED_BITS_PER_PIX / 8)
++
++#define SPHAERO_REG_FB_ADDR_LOW 1
++#define SPHAERO_REG_FB_ADDR_HIGH 2
++#define SPHAERO_REG_FB_SIZE_LOW 3
++#define SPHAERO_REG_FB_SIZE_HIGH 4
++#define SPHAERO_REG_FB_COMMIT_FRAME 5
++
++static const struct pci_device_id pci_table[] = {
++        { PCI_DEVICE(PCI_VENDOR_ID_SPHAERO,     PCI_DEVICE_ID_SPHAERO), },
++        { },
++};
++
++struct sphaero_priv {
++	volatile uint32_t __iomem* regs;
++	struct drm_connector connector;
++	struct drm_encoder encoder;
++	struct drm_crtc crtc;
++};
++
++static void sphaero_conn_destroy(struct drm_connector *connector) {
++	// destroy function is called unguarded, and there are no existing
++	// drm_helper functions to do this cleanup for us. Model after
++	// virtio_gpu
++	drm_connector_unregister(connector);
++	drm_connector_cleanup(connector);
++}
++
++static const struct drm_connector_funcs sphaero_gpu_connector_funcs = {
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.destroy = sphaero_conn_destroy,
++	.reset = drm_atomic_helper_connector_reset,
++	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++};
++
++static int sphaero_gpu_conn_get_modes(struct drm_connector *connector) {
++	// drm_add_modes_noedid would have been called by the caller if we did
++	// nothing here, however it would _not_ set the preferred mode, which
++	// our testing app relies on
++	int count = drm_add_modes_noedid(connector, 1024, 768);
++	drm_set_preferred_mode(connector, 1024, 768);
++	return count;
++}
++
++static const struct drm_connector_helper_funcs sphaero_gpu_conn_helper_funcs = {
++	.get_modes    = sphaero_gpu_conn_get_modes,
++};
++
++static const struct drm_framebuffer_funcs sphaero_gpu_fb_funcs = {
++	.create_handle = drm_gem_fb_create_handle,
++	.destroy = drm_gem_fb_destroy,
++	.dirty = drm_atomic_helper_dirtyfb,
++};
++
++static struct drm_framebuffer *sphaero_gpu_framebuffer_create(struct drm_device *dev,
++				     struct drm_file *file_priv,
++				     const struct drm_mode_fb_cmd2 *mode_cmd) {
++	struct drm_gem_object* obj = drm_gem_object_lookup(file_priv, mode_cmd->handles[0]);
++	if (!obj) {
++		printk("Failed to find object\n");
++		return ERR_PTR(-EINVAL);
++	}
++
++	struct drm_framebuffer *fb = kzalloc(sizeof(*fb), GFP_KERNEL);
++
++	drm_helper_mode_fill_fb_struct(dev, fb, mode_cmd);
++	int rc = drm_framebuffer_init(dev, fb, &sphaero_gpu_fb_funcs);
++	if (rc != 0) {
++		drm_gem_object_put(obj);
++		kfree(fb);
++		return ERR_PTR(rc);
++	}
++
++	fb->obj[0] = obj;
++	return fb;
++}
++
++static const struct drm_mode_config_funcs sphaero_drv_mode_funcs = {
++	.fb_create = sphaero_gpu_framebuffer_create,
++	.atomic_check = drm_atomic_helper_check,
++	.atomic_commit = drm_atomic_helper_commit,
++};
++
++static int sphaero_gpu_dumb_create(struct drm_file *file_priv,
++		   struct drm_device *dev,
++		   struct drm_mode_create_dumb *args) {
++
++	int rc = 0;
++	if (args->bpp != SPHAERO_SUPPORTED_BITS_PER_PIX) {
++		return -EINVAL;
++	}
++
++	args->pitch = args-> width * SPHAERO_BYTES_PER_PIX;
++	args->size = args->pitch * args->height;
++
++	struct drm_gem_shmem_object *shmem_obj = drm_gem_shmem_create(dev, args->size);
++	if (IS_ERR(shmem_obj)) {
++		return PTR_ERR(shmem_obj);
++	}
++
++	rc = drm_gem_handle_create(file_priv, &shmem_obj->base, &args->handle);
++
++	// Both error and non-error path have to release their reference
++	// to the created object, the handle owns it now. If the handle failed
++	// to create, then the object should get freed anyways... I think,
++	// I don't actually know
++	drm_gem_object_put(&shmem_obj->base);
++	return rc;
++}
++
++static const struct drm_plane_funcs sphaero_gpu_plane_funcs = {
++	.update_plane		= drm_atomic_helper_update_plane,
++	.disable_plane		= drm_atomic_helper_disable_plane,
++	.reset			= drm_atomic_helper_plane_reset,
++	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
++};
++
++static void sphaero_gpu_plane_update(struct drm_plane *plane,
++		      struct drm_atomic_state *state) {
++
++	struct drm_device* drm_dev = plane->dev;
++	struct sphaero_priv* priv = drm_dev->dev_private;
++
++	if (plane == NULL || plane->state == NULL || plane->state->fb == NULL) {
++		// FIXME: Should blank out screen or something
++		return;
++	}
++
++	struct drm_gem_object* gem_obj = plane->state->fb->obj[0];
++	struct drm_gem_shmem_object* shmem_obj = container_of(gem_obj, struct drm_gem_shmem_object, base);
++	// It seems like we are leaking a locked resource here, and we kinda
++	// are, however the table is held as a member of shmem_obj and re-used
++	// on future mappings. It seems like the model here is that if we are
++	// mapping a gem for DMA, it should stay mapped for the lifetime of
++	// the gem handle. It will get unmapped when the object is freed
++	struct sg_table* sg_table = drm_gem_shmem_get_pages_sgt(shmem_obj);
++	if (IS_ERR(sg_table)) {
++		return;
++	}
++
++	struct scatterlist *sg;
++	int si;
++	for_each_sgtable_dma_sg(sg_table, sg, si) {
++		u64 dma_addr = sg_dma_address(sg);
++		u64 dma_length = sg_dma_len(sg);
++		priv->regs[SPHAERO_REG_FB_ADDR_LOW]  = cpu_to_le32(dma_addr);
++		priv->regs[SPHAERO_REG_FB_ADDR_HIGH] = cpu_to_le32(dma_addr >> 32);
++		priv->regs[SPHAERO_REG_FB_SIZE_LOW]  = cpu_to_le32(dma_length);
++		priv->regs[SPHAERO_REG_FB_SIZE_HIGH] = cpu_to_le32(dma_length >> 32);
++	}
++	priv->regs[SPHAERO_REG_FB_COMMIT_FRAME] = 0;
++}
++
++static const struct drm_plane_helper_funcs sphaero_gpu_primary_helper_funcs = {
++	.atomic_update		= sphaero_gpu_plane_update,
++};
++
++// FIXME: Cursor might want ARGB or else no alpha
++static const uint32_t sphaero_gpu_formats[] = {
++	DRM_FORMAT_HOST_XRGB8888,
++};
++
++static const struct drm_crtc_funcs sphaero_gpu_crtc_funcs = {
++	.set_config             = drm_atomic_helper_set_config,
++	.destroy                = drm_crtc_cleanup,
++
++	.page_flip              = drm_atomic_helper_page_flip,
++	.reset                  = drm_atomic_helper_crtc_reset,
++	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state   = drm_atomic_helper_crtc_destroy_state,
++};
++
++static const struct drm_crtc_helper_funcs sphaero_gpu_crtc_helper_funcs = {0};
++
++// Assumed single possible crtc at index 0
++#define SPHAERO_POSSIBLE_CRTCS (1 << 0)
++
++static int sphaero_make_crtc(struct sphaero_priv* priv, struct drm_device* drm_dev) {
++	struct drm_plane* primary_plane = drmm_universal_plane_alloc(drm_dev, struct drm_plane, dev,
++					   SPHAERO_POSSIBLE_CRTCS, &sphaero_gpu_plane_funcs,
++					   sphaero_gpu_formats, 1, NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
++	if (IS_ERR(primary_plane)) {
++		return PTR_ERR(primary_plane);
++	}
++
++	drm_plane_helper_add(primary_plane, &sphaero_gpu_primary_helper_funcs);
++	drm_plane_enable_fb_damage_clips(primary_plane);
++
++	int rc = drm_crtc_init_with_planes(drm_dev, &priv->crtc, primary_plane, NULL,
++				  &sphaero_gpu_crtc_funcs, NULL);
++	if (rc != 0) {
++		drmm_kfree(drm_dev, primary_plane);
++		return rc;
++	}
++
++	drm_crtc_helper_add(&priv->crtc, &sphaero_gpu_crtc_helper_funcs);
++
++	return 0;
++}
++
++static int sphaero_pci_init(struct pci_dev *pdev, struct sphaero_priv* priv) {
++	int rc = 0;
++
++	rc = pci_enable_device(pdev);
++	if (rc) {
++		return rc;
++	}
++
++	rc = pci_request_regions(pdev, DRV_NAME);
++	if (rc) {
++		pci_disable_device(pdev);
++	}
++
++	resource_size_t pciaddr = pci_resource_start(pdev, 0);
++
++	priv->regs = ioremap(pciaddr, 32);
++	return rc;
++}
++
++static void sphaero_pci_deinit(struct pci_dev *pdev) {
++	pci_disable_device(pdev);
++}
++
++static void sphaero_priv_deinit(struct sphaero_priv* priv) {
++	if (priv->regs) {
++		iounmap(priv->regs);
++	}
++	kfree(priv);
++}
++
++static struct drm_device* sphaero_drm_init(struct device* dev, struct sphaero_priv* priv) {
++	struct drm_device *drm_dev = drm_dev_alloc(&driver, dev);
++	int rc = drmm_mode_config_init(drm_dev);
++	if (rc)
++		goto err;
++
++	drm_dev->dev_private = priv;
++
++	drm_dev->mode_config.funcs = &sphaero_drv_mode_funcs;
++	drm_dev->mode_config.min_width = 32;
++	drm_dev->mode_config.min_height = 32;
++	drm_dev->mode_config.max_width = 1024;
++	drm_dev->mode_config.max_height = 768;
++
++	drm_connector_init(drm_dev, &priv->connector, &sphaero_gpu_connector_funcs,
++			   DRM_MODE_CONNECTOR_VIRTUAL);
++	drm_connector_helper_add(&priv->connector, &sphaero_gpu_conn_helper_funcs);
++	drm_simple_encoder_init(drm_dev, &priv->encoder, DRM_MODE_ENCODER_VIRTUAL);
++	sphaero_make_crtc(priv, drm_dev);
++
++	priv->encoder.possible_crtcs = SPHAERO_POSSIBLE_CRTCS;
++	drm_connector_attach_encoder(&priv->connector, &priv->encoder);
++
++	drm_mode_config_reset(drm_dev);
++
++	rc = drm_dev_register(drm_dev, 0);
++	if (rc)
++		goto err;
++
++	return drm_dev;
++
++err:
++	drm_dev_put(drm_dev);
++	return ERR_PTR(rc);
++}
++
++static int sphaero_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
++{
++	int rc = 0;
++
++	struct sphaero_priv* priv = kzalloc(sizeof(struct sphaero_priv), GFP_KERNEL);
++
++	rc = sphaero_pci_init(pdev, priv);
++	if (rc) {
++		goto err_pci;
++	}
++
++	struct drm_device *drm_dev = sphaero_drm_init(&pdev->dev, priv);
++	if (IS_ERR(drm_dev)) {
++		rc = PTR_ERR(drm_dev);
++		goto err_make_drm;
++	}
++
++	// So we don't have to track drm_dev from our structure as well. Pci
++	// removal can go through the drm data to get to priv
++	pci_set_drvdata(pdev, drm_dev);
++
++	return 0;
++
++err_make_drm:
++	sphaero_pci_deinit(pdev);
++err_pci:
++	sphaero_priv_deinit(priv);
++	return rc;
++}
++
++static void sphaero_remove(struct pci_dev *dev) {
++	struct drm_device *drm_dev = pci_get_drvdata(dev);
++	struct sphaero_priv *priv = drm_dev->dev_private;
++
++	drm_dev_unplug(drm_dev);
++	drm_atomic_helper_shutdown(drm_dev);
++	drm_dev_put(drm_dev);
++
++	sphaero_priv_deinit(priv);
++
++	sphaero_pci_deinit(dev);
++}
++
++static struct pci_driver sphaero_driver = {
++	.name         = DRV_NAME,
++	.id_table     = pci_table,
++	.probe        =	sphaero_probe,
++	.remove       = sphaero_remove,
++};
++
++module_pci_driver(sphaero_driver);
++
++DEFINE_DRM_GEM_FOPS(sphaero_gpu_fops);
++
++static const struct drm_driver driver = {
++	/*
++	 * If KMS is disabled DRIVER_MODESET and DRIVER_ATOMIC are masked
++	 * out via drm_device::driver_features:
++	 */
++	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER | DRIVER_ATOMIC |
++			   DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE | DRIVER_CURSOR_HOTSPOT,
++	.name = "sphaero_gpu",
++	.dumb_create = sphaero_gpu_dumb_create,
++	.desc = "Sphaerophoria's testing gpu",
++	.fops = &sphaero_gpu_fops,
++};
++
++MODULE_LICENSE("GPL");
+-- 
+2.44.1
+

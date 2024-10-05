@@ -40,11 +40,11 @@ $(BUILDROOT_SRC): $(BUILDROOT_TARBALL)
 
 $(LINUX_SRC): $(LINUX_TARBALL)
 	$(call do_extract)
-	cd $@ && git init && git add . && git commit -m "Import linux $(LINUX_VERSION)" && git am $(CURDIR)/patch/linux/0001-Proof-of-concept-PCI-led-device.patch
+	cd $@ && git init && git add . && git commit -m "Import linux $(LINUX_VERSION)" && git am $(CURDIR)/patch/linux/*
 
 $(QEMU_SRC): $(QEMU_TARBALL)
 	$(call do_extract)
-	cd $@ && git init && git add . && git commit -m "Import qemu $(QEMU_VERSION)" && git am $(CURDIR)/patch/qemu/0001-Proof-of-concept-pci-device.patch
+	cd $@ && git init && git add . && git commit -m "Import qemu $(QEMU_VERSION)" && git am $(CURDIR)/patch/qemu/*
 
 buildroot: $(BUILDROOT_SRC)
 	mkdir -p build/buildroot
