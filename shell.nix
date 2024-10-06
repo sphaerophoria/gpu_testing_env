@@ -17,6 +17,7 @@ in
       file
       wget
       libxcrypt
+      gdb
       clang-tools
     ]
     ++ pkgs.linux.nativeBuildInputs);
