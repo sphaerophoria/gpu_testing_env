@@ -1,0 +1,97 @@
+From 62c860f3a0789f8aee6a38473ed0a5cbb11be2ad Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Sat, 12 Oct 2024 19:01:17 +0000
+Subject: [PATCH] Add entrypoint for spahero_gpu
+
+---
+ bin/git_sha1_gen.py                                    |  2 +-
+ src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c    |  1 +
+ src/gallium/auxiliary/target-helpers/drm_helper.h      | 10 ++++++++++
+ .../auxiliary/target-helpers/drm_helper_public.h       |  1 +
+ src/gallium/targets/dri/target.c                       |  2 ++
+ 5 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/bin/git_sha1_gen.py b/bin/git_sha1_gen.py
+index a457b31..e325998 100644
+--- a/bin/git_sha1_gen.py
++++ b/bin/git_sha1_gen.py
+@@ -42,9 +42,9 @@ parser = argparse.ArgumentParser()
+ parser.add_argument('--output', help='File to write the #define in',
+                     required=True)
+ args = parser.parse_args()
+ 
+-git_sha1 = os.environ.get('MESA_GIT_SHA1_OVERRIDE', get_git_sha1())[:10]
++git_sha1 = None # Hack to allow swapping libs with buildroot compiled mesa
+ if git_sha1:
+     write_if_different('#define MESA_GIT_SHA1 " (git-' + git_sha1 + ')"')
+ else:
+     write_if_different('#define MESA_GIT_SHA1 ""')
+diff --git a/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c b/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
+index 055c637..0b5c51a 100644
+--- a/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
++++ b/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
+@@ -78,8 +78,9 @@ static const struct drm_driver_descriptor *driver_descriptors[] = {
+    &vmwgfx_driver_descriptor,
+    &kgsl_driver_descriptor,
+    &msm_driver_descriptor,
+    &virtio_gpu_driver_descriptor,
++   &sphaero_gpu_driver_descriptor,
+    &v3d_driver_descriptor,
+    &vc4_driver_descriptor,
+    &panfrost_driver_descriptor,
+    &asahi_driver_descriptor,
+diff --git a/src/gallium/auxiliary/target-helpers/drm_helper.h b/src/gallium/auxiliary/target-helpers/drm_helper.h
+index be44b8f..f392271 100644
+--- a/src/gallium/auxiliary/target-helpers/drm_helper.h
++++ b/src/gallium/auxiliary/target-helpers/drm_helper.h
+@@ -288,8 +288,18 @@ DRM_DRIVER_DESCRIPTOR(virtio_gpu, virgl_driconf, ARRAY_SIZE(virgl_driconf))
+ #else
+ DRM_DRIVER_DESCRIPTOR_STUB(virtio_gpu)
+ #endif
+ 
++static struct pipe_screen *
++pipe_sphaero_gpu_create_screen(int fd, const struct pipe_screen_config *config)
++{
++   struct pipe_screen *screen = NULL;
++   printf("Calling sphaero_gpu_create_screen\n");
++   return screen;
++}
++
++DRM_DRIVER_DESCRIPTOR(sphaero_gpu, NULL, 0)
++
+ #ifdef GALLIUM_VC4
+ #include "vc4/drm/vc4_drm_public.h"
+ 
+ static struct pipe_screen *
+diff --git a/src/gallium/auxiliary/target-helpers/drm_helper_public.h b/src/gallium/auxiliary/target-helpers/drm_helper_public.h
+index 89c0a42..c253ea3 100644
+--- a/src/gallium/auxiliary/target-helpers/drm_helper_public.h
++++ b/src/gallium/auxiliary/target-helpers/drm_helper_public.h
+@@ -14,8 +14,9 @@ extern const struct drm_driver_descriptor radeonsi_driver_descriptor;
+ extern const struct drm_driver_descriptor vmwgfx_driver_descriptor;
+ extern const struct drm_driver_descriptor kgsl_driver_descriptor;
+ extern const struct drm_driver_descriptor msm_driver_descriptor;
+ extern const struct drm_driver_descriptor virtio_gpu_driver_descriptor;
++extern const struct drm_driver_descriptor sphaero_gpu_driver_descriptor;
+ extern const struct drm_driver_descriptor v3d_driver_descriptor;
+ extern const struct drm_driver_descriptor vc4_driver_descriptor;
+ extern const struct drm_driver_descriptor panfrost_driver_descriptor;
+ extern const struct drm_driver_descriptor asahi_driver_descriptor;
+diff --git a/src/gallium/targets/dri/target.c b/src/gallium/targets/dri/target.c
+index 415e494..12d4424 100644
+--- a/src/gallium/targets/dri/target.c
++++ b/src/gallium/targets/dri/target.c
+@@ -71,8 +71,10 @@ DEFINE_LOADER_DRM_ENTRYPOINT(kgsl)
+ #if defined(GALLIUM_VIRGL) || (defined(GALLIUM_FREEDRENO) && !defined(PIPE_LOADER_DYNAMIC))
+ DEFINE_LOADER_DRM_ENTRYPOINT(virtio_gpu)
+ #endif
+ 
++DEFINE_LOADER_DRM_ENTRYPOINT(sphaero_gpu)
++
+ #if defined(GALLIUM_V3D)
+ DEFINE_LOADER_DRM_ENTRYPOINT(v3d)
+ #endif
+ 
+-- 
+2.44.1
+

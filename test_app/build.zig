@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) !void {
     exe.addLibraryPath(b.path("../build/buildroot/staging/usr/lib"));
     exe.addIncludePath(b.path("src"));
     exe.linkSystemLibrary("drm");
+    exe.linkSystemLibrary("EGL");
+    exe.linkSystemLibrary("gbm");
     exe.linkLibC();
 
     b.installArtifact(exe);
