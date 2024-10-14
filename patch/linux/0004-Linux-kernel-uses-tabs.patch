@@ -1,0 +1,92 @@
+From d893db961679e3f8c99f7f09413489d243879d10 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Thu, 17 Oct 2024 19:58:31 +0000
+Subject: [PATCH 1/2] Linux kernel uses tabs
+
+---
+ drivers/gpu/drm/sphaero/sphaero_drv.c | 38 +++++++++++++--------------
+ 1 file changed, 19 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/sphaero/sphaero_drv.c b/drivers/gpu/drm/sphaero/sphaero_drv.c
+index d2cdcd1fc..13b004d06 100644
+--- a/drivers/gpu/drm/sphaero/sphaero_drv.c
++++ b/drivers/gpu/drm/sphaero/sphaero_drv.c
+@@ -28,24 +28,24 @@ static const struct drm_driver driver;
+ #define SPHAERO_SUPPORTED_BITS_PER_PIX 32
+ #define SPHAERO_BYTES_PER_PIX (SPHAERO_SUPPORTED_BITS_PER_PIX / 8)
+ 
+ enum sphaero_reg_cmd {
+-    SPHAERO_REG_CMD_PUSH_FB_CHUNK,
+-    SPHAERO_REG_CMD_COMMIT_FB,
+-    SPHAERO_REG_CMD_SET_VB_SIZE,
+-    SPHAERO_REG_CMD_PUSH_VB_CHUNK,
+-    SPHAERO_REG_CMD_SET_TEXTURE_SIZE,
+-    SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK,
+-    SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM,
+-    SPHAERO_REG_CMD_MAX,
++	SPHAERO_REG_CMD_PUSH_FB_CHUNK,
++	SPHAERO_REG_CMD_COMMIT_FB,
++	SPHAERO_REG_CMD_SET_VB_SIZE,
++	SPHAERO_REG_CMD_PUSH_VB_CHUNK,
++	SPHAERO_REG_CMD_SET_TEXTURE_SIZE,
++	SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK,
++	SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM,
++	SPHAERO_REG_CMD_MAX,
+ };
+ 
+ 
+ #define DRM_SPHAERO_NUM_IOCTLS 5
+ 
+ static const struct pci_device_id pci_table[] = {
+-        { PCI_DEVICE(PCI_VENDOR_ID_SPHAERO,     PCI_DEVICE_ID_SPHAERO), },
+-        { },
++	{ PCI_DEVICE(PCI_VENDOR_ID_SPHAERO, PCI_DEVICE_ID_SPHAERO), },
++	{ },
+ };
+ 
+ struct sphaero_priv {
+ 	volatile uint32_t __iomem* regs;
+@@ -89,10 +89,10 @@ static const struct drm_framebuffer_funcs sphaero_gpu_fb_funcs = {
+ 	.dirty = drm_atomic_helper_dirtyfb,
+ };
+ 
+ static struct drm_framebuffer *sphaero_gpu_framebuffer_create(struct drm_device *dev,
+-				     struct drm_file *file_priv,
+-				     const struct drm_mode_fb_cmd2 *mode_cmd) {
++		struct drm_file *file_priv,
++		const struct drm_mode_fb_cmd2 *mode_cmd) {
+ 	struct drm_gem_object* obj = drm_gem_object_lookup(file_priv, mode_cmd->handles[0]);
+ 	if (!obj) {
+ 		printk("Failed to find object\n");
+ 		return ERR_PTR(-EINVAL);
+@@ -431,20 +431,20 @@ static int sphaero_gpu_upload_vb_ioctl(struct drm_device *dev, void *data,
+ 	return sphaero_gpu_upload_ioctl_sized(dev, data, file, SPHAERO_REG_CMD_SET_VB_SIZE, SPHAERO_REG_CMD_PUSH_VB_CHUNK);
+ }
+ 
+ static int sphaero_gpu_upload_texture_ioctl(struct drm_device *dev, void *data,
+-				struct drm_file *file) {
++                                            struct drm_file *file) {
+ 	return sphaero_gpu_upload_ioctl_sized(dev, data, file, SPHAERO_REG_CMD_SET_TEXTURE_SIZE, SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK);
+ }
+ 
+ static int sphaero_gpu_upload_transform_ioctl(struct drm_device *dev, void *data,
+-                               struct drm_file *file) {
+-       struct drm_sphaero_upload_gpu_obj *params = data;
+-       if (params->size != 16 * 4) {
+-	       return -EINVAL;
+-       }
++                                              struct drm_file *file) {
++	struct drm_sphaero_upload_gpu_obj *params = data;
++	if (params->size != 16 * 4) {
++		return -EINVAL;
++	}
+ 
+-       return sphaero_gpu_upload_ioctl_unsized(dev, data, file, SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM);
++	return sphaero_gpu_upload_ioctl_unsized(dev, data, file, SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM);
+ }
+ 
+ 
+ struct drm_ioctl_desc sphaero_gpu_ioctls[DRM_SPHAERO_NUM_IOCTLS] = {
+-- 
+2.44.1
+

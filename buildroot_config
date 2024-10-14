@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Buildroot -gfde02b5-dirty Configuration
+# Buildroot -gf463fe3 Configuration
 #
 BR2_HAVE_DOT_CONFIG=y
 BR2_HOST_GCC_AT_LEAST_4_9=y
@@ -181,6 +181,7 @@ BR2_PACKAGE_HOST_GDB_ARCH_SUPPORTS=y
 # Host GDB Options
 #
 # BR2_PACKAGE_HOST_GDB is not set
+BR2_GDB_VERSION="14.2"
 
 #
 # Toolchain Generic Options
@@ -601,7 +602,10 @@ BR2_PACKAGE_DELVE_ARCH_SUPPORTS=y
 BR2_PACKAGE_FWTS_ARCH_SUPPORTS=y
 # BR2_PACKAGE_FWTS is not set
 BR2_PACKAGE_GDB_ARCH_SUPPORTS=y
-# BR2_PACKAGE_GDB is not set
+BR2_PACKAGE_GDB=y
+# BR2_PACKAGE_GDB_SERVER is not set
+BR2_PACKAGE_GDB_DEBUGGER=y
+BR2_PACKAGE_GDB_TUI=y
 BR2_PACKAGE_GOOGLE_BREAKPAD_ARCH_SUPPORTS=y
 # BR2_PACKAGE_GOOGLE_BREAKPAD is not set
 # BR2_PACKAGE_HYPERFINE is not set
@@ -2290,7 +2294,7 @@ BR2_PACKAGE_LIBZENOH_C_ARCH_SUPPORTS=y
 # BR2_PACKAGE_GLIBMM is not set
 # BR2_PACKAGE_GLIBMM2_66 is not set
 # BR2_PACKAGE_GLM is not set
-# BR2_PACKAGE_GMP is not set
+BR2_PACKAGE_GMP=y
 BR2_PACKAGE_GOBJECT_INTROSPECTION_ARCH_SUPPORTS=y
 
 #
@@ -2395,7 +2399,7 @@ BR2_PACKAGE_LLVM_TARGET_ARCH="X86"
 # BR2_PACKAGE_MATIO is not set
 # BR2_PACKAGE_MPC is not set
 # BR2_PACKAGE_MPDECIMAL is not set
-# BR2_PACKAGE_MPFR is not set
+BR2_PACKAGE_MPFR=y
 # BR2_PACKAGE_MPIR is not set
 # BR2_PACKAGE_MSGPACK is not set
 # BR2_PACKAGE_NEON_2_SSE is not set
@@ -2454,7 +2458,10 @@ BR2_PACKAGE_PROTOBUF_ARCH_SUPPORTS=y
 # BR2_PACKAGE_LIBUNIBREAK is not set
 # BR2_PACKAGE_LIBUNISTRING is not set
 # BR2_PACKAGE_LINENOISE is not set
-# BR2_PACKAGE_NCURSES is not set
+BR2_PACKAGE_NCURSES=y
+# BR2_PACKAGE_NCURSES_WCHAR is not set
+# BR2_PACKAGE_NCURSES_TARGET_PROGS is not set
+BR2_PACKAGE_NCURSES_ADDITIONAL_TERMINFO=""
 # BR2_PACKAGE_NEWT is not set
 # BR2_PACKAGE_ONIGURUMA is not set
 # BR2_PACKAGE_PCRE is not set
@@ -2820,35 +2827,35 @@ BR2_PACKAGE_OPENSSH_SANDBOX=y
 #
 
 #
-# Please note:                                           
+# Please note:
 #
 
 #
-# - Buildroot does *not* generate binary packages,       
+# - Buildroot does *not* generate binary packages,
 #
 
 #
-# - Buildroot does *not* install any package database.   
+# - Buildroot does *not* install any package database.
 #
 
 #
-# *                                                      
+# *
 #
 
 #
-# It is up to you to provide those by yourself if you    
+# It is up to you to provide those by yourself if you
 #
 
 #
-# want to use any of those package managers.             
+# want to use any of those package managers.
 #
 
 #
-# *                                                      
+# *
 #
 
 #
-# See the manual:                                        
+# See the manual:
 #
 
 #
@@ -3183,7 +3190,7 @@ BR2_TARGET_ROOTFS_EXT2_2r1=y
 BR2_TARGET_ROOTFS_EXT2_GEN=2
 BR2_TARGET_ROOTFS_EXT2_REV=1
 BR2_TARGET_ROOTFS_EXT2_LABEL="rootfs"
-BR2_TARGET_ROOTFS_EXT2_SIZE="120M"
+BR2_TARGET_ROOTFS_EXT2_SIZE="512M"
 BR2_TARGET_ROOTFS_EXT2_INODES=0
 BR2_TARGET_ROOTFS_EXT2_INODE_SIZE=256
 BR2_TARGET_ROOTFS_EXT2_RESBLKS=5

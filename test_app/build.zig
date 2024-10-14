@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) !void {
     exe.addIncludePath(b.path("src"));
     exe.linkSystemLibrary("drm");
     exe.linkSystemLibrary("EGL");
+    exe.linkSystemLibrary("GL");
     exe.linkSystemLibrary("gbm");
     exe.linkLibC();
 

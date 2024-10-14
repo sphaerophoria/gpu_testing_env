@@ -1,0 +1,199 @@
+From a2ff474f06a203052f964a70d422b6016a4dc12f Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Sat, 12 Oct 2024 20:16:06 -0700
+Subject: [PATCH 2/3] Prevent early egl init crashes with sphaero_gpu
+
+Stub out functions to get through eglGetDisplay and eglInitialize calls
+when using a sphaero_gpu gbm device.
+---
+ .../auxiliary/target-helpers/drm_helper.h     |  5 +-
+ src/gallium/meson.build                       |  3 +
+ src/gallium/targets/dri/meson.build           |  2 +-
+ src/gallium/winsys/sphaero/drm/meson.build    | 27 +++++++
+ .../winsys/sphaero/drm/sphaero_drm_public.h   |  9 +++
+ .../winsys/sphaero/drm/sphaero_drm_winsys.c   | 71 +++++++++++++++++++
+ 6 files changed, 113 insertions(+), 4 deletions(-)
+ create mode 100644 src/gallium/winsys/sphaero/drm/meson.build
+ create mode 100644 src/gallium/winsys/sphaero/drm/sphaero_drm_public.h
+ create mode 100644 src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+
+diff --git a/src/gallium/auxiliary/target-helpers/drm_helper.h b/src/gallium/auxiliary/target-helpers/drm_helper.h
+index f392271..1d45d11 100644
+--- a/src/gallium/auxiliary/target-helpers/drm_helper.h
++++ b/src/gallium/auxiliary/target-helpers/drm_helper.h
+@@ -288,14 +288,13 @@ DRM_DRIVER_DESCRIPTOR(virtio_gpu, virgl_driconf, ARRAY_SIZE(virgl_driconf))
+ #else
+ DRM_DRIVER_DESCRIPTOR_STUB(virtio_gpu)
+ #endif
+ 
++#include "sphaero/drm/sphaero_drm_public.h"
+ static struct pipe_screen *
+ pipe_sphaero_gpu_create_screen(int fd, const struct pipe_screen_config *config)
+ {
+-   struct pipe_screen *screen = NULL;
+-   printf("Calling sphaero_gpu_create_screen\n");
+-   return screen;
++   return sphaero_drm_screen_create(fd, config);
+ }
+ 
+ DRM_DRIVER_DESCRIPTOR(sphaero_gpu, NULL, 0)
+ 
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+index 42b9336..9b528cf 100644
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -172,8 +172,11 @@ if with_gallium_virgl
+   subdir('drivers/virgl')
+ else
+   driver_virgl = declare_dependency()
+ endif
++
++subdir('winsys/sphaero/drm')
++
+ if with_gallium_lima
+   subdir('winsys/lima/drm')
+   subdir('drivers/lima')
+ else
+diff --git a/src/gallium/targets/dri/meson.build b/src/gallium/targets/dri/meson.build
+index 8392524..8770e49 100644
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -51,9 +51,9 @@ libgallium_dri = shared_library(
+   link_depends : gallium_dri_link_depends,
+   link_with : [
+     libdri, libmesa, libgalliumvl,
+     libgallium, libglapi, libloader, libpipe_loader_static, libws_null, libwsw, libswdri,
+-    libswkmsdri,
++    libswkmsdri, libsphaerodrm
+   ],
+   dependencies : [
+     dep_selinux, dep_libdrm, dep_llvm, dep_thread, idep_xmlconfig, idep_mesautil,
+     driver_swrast, driver_r300, driver_r600, driver_radeonsi, driver_nouveau,
+diff --git a/src/gallium/winsys/sphaero/drm/meson.build b/src/gallium/winsys/sphaero/drm/meson.build
+new file mode 100644
+index 0000000..3d9f717
+--- /dev/null
++++ b/src/gallium/winsys/sphaero/drm/meson.build
+@@ -0,0 +1,27 @@
++# Copyright © 2017 Intel Corporation
++
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++
++# The above copyright notice and this permission notice shall be included in
++# all copies or substantial portions of the Software.
++
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++libsphaerodrm = static_library(
++  'sphaerodrm',
++  'sphaero_drm_winsys.c',
++  include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium, inc_gallium_aux, inc_gallium_drivers],
++  dependencies : [dep_libdrm, dep_libvirglcommon, idep_mesautil, idep_nir_headers],
++  gnu_symbol_visibility : 'hidden',
++)
+diff --git a/src/gallium/winsys/sphaero/drm/sphaero_drm_public.h b/src/gallium/winsys/sphaero/drm/sphaero_drm_public.h
+new file mode 100644
+index 0000000..2412dda
+--- /dev/null
++++ b/src/gallium/winsys/sphaero/drm/sphaero_drm_public.h
+@@ -0,0 +1,9 @@
++#ifndef SPHAERO_DRM_PUBLIC_H
++#define SPHAERO_DRM_PUBLIC_H
++
++struct pipe_screen;
++struct pipe_screen_config;
++
++struct pipe_screen *sphaero_drm_screen_create(int fd, const struct pipe_screen_config *config);
++
++#endif
+diff --git a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+new file mode 100644
+index 0000000..bf32e37
+--- /dev/null
++++ b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+@@ -0,0 +1,71 @@
++
++#include "sphaero_drm_public.h"
++#include "pipe/p_screen.h"
++#include "util/u_memory.h"
++#include "util/u_screen.h"
++#include "util/format/u_format.h"
++
++static int sphaero_get_screen_fd(struct pipe_screen *screen) {
++   return -1;
++}
++
++static int sphaero_drm_get_param(struct pipe_screen *screen, enum pipe_cap param) {
++   switch (param) {
++      case PIPE_CAP_MAX_TEXTURE_2D_SIZE: return 16384; break;
++      case PIPE_CAP_MAX_TEXTURE_3D_LEVELS: return 5; break; // Arbitrary
++      case PIPE_CAP_MAX_TEXTURE_CUBE_LEVELS: return 5; break; // Arbitrary
++      case PIPE_CAP_ACCELERATED: return -1; break;
++      case PIPE_CAP_VIDEO_MEMORY: return 0; break;
++      case PIPE_CAP_UMA: return 0; break;
++      default: return u_pipe_screen_get_param_defaults(screen, param); break;
++   }
++}
++static float
++sphaero_drm_get_paramf(struct pipe_screen *screen, enum pipe_capf param)
++{
++   printf("Unhandled pipe_capf param %d\n", param);
++   return 0.0f;
++}
++
++static int
++sphaero_drm_get_shader_param(struct pipe_screen *screen,
++                       enum pipe_shader_type shader,
++                       enum pipe_shader_cap param) {
++   printf("Got shader request for shader %d param %d\n", shader, param);
++   return 0;
++}
++
++static bool sphaero_drm_is_format_supported(struct pipe_screen *screen,
++                            enum pipe_format format,
++                            enum pipe_texture_target target,
++                            unsigned sample_count,
++                            unsigned storage_sample_count,
++                            unsigned bindings) {
++
++   if (format != PIPE_FORMAT_BGRA8888_UNORM) {
++      return false;
++   }
++   printf("format: %d, sample count: %d, storage_sample_count: %d\n", format, sample_count, storage_sample_count);
++   if (format == PIPE_FORMAT_BGRA8888_UNORM && sample_count < 2 && storage_sample_count < 2) {
++      printf("It's supported\n");
++      return true;
++   }
++   printf("It's rejected\n");
++   return false;
++}
++
++static void sphaero_drm_destroy(struct pipe_screen * screen) {
++   FREE(screen);
++}
++
++struct pipe_screen *sphaero_drm_screen_create(int fd, const struct pipe_screen_config *config) {
++   struct pipe_screen *screen = CALLOC_STRUCT(pipe_screen);
++
++   screen->get_param = sphaero_drm_get_param;
++   screen->get_paramf = sphaero_drm_get_paramf;
++   screen->get_screen_fd = sphaero_get_screen_fd;
++   screen->get_shader_param = sphaero_drm_get_shader_param;
++   screen->is_format_supported = sphaero_drm_is_format_supported;
++   screen->destroy = sphaero_drm_destroy;
++   return screen;
++}
+-- 
+2.44.1
+

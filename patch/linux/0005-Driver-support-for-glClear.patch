@@ -1,0 +1,265 @@
+From bf3e835e25495d2cc6fe0d32941b149eae43c00d Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Tue, 15 Oct 2024 21:21:04 +0000
+Subject: [PATCH 2/2] Driver support for glClear()
+
+Implement driver APIs required for a simple demo opengl app that only
+clears the screen.
+
+We are moving towards doing more on the GPU. We had the option of
+allocating a texture in shared memory and passing that to the GPU to
+work on. We'd prefer that these objects live GPU side
+
+For the time being, we have implemented a new GEM object type that just
+points to a hardware allocated buffer. When mesa asks for a new texture
+we create a hardware backed one instead of a shmem backed one.
+
+The clear ioctl will ask the gpu to clear this hardware allocated
+texture
+
+This causes some slight issues as the framebuffer management now needs
+to work for both hardware and shmem backed buffers. In the future we
+will implement mmap for our hw buffers and we can get rid of any shmem
+related objects
+---
+ drivers/gpu/drm/sphaero/sphaero_drv.c | 107 +++++++++++++++++++++++++-
+ include/uapi/drm/sphaero_drm.h        |  29 +++++++
+ 2 files changed, 132 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/sphaero/sphaero_drv.c b/drivers/gpu/drm/sphaero/sphaero_drv.c
+index 13b004d06..5994f302a 100644
+--- a/drivers/gpu/drm/sphaero/sphaero_drv.c
++++ b/drivers/gpu/drm/sphaero/sphaero_drv.c
+@@ -35,24 +35,30 @@ enum sphaero_reg_cmd {
+ 	SPHAERO_REG_CMD_PUSH_VB_CHUNK,
+ 	SPHAERO_REG_CMD_SET_TEXTURE_SIZE,
+ 	SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK,
+ 	SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM,
++	SPHAERO_REG_CMD_CREATE_GL_TEX,
++	SPHAERO_REG_CMD_GL_CLEAR,
++	SPHAERO_REG_CMD_SET_HW_FB,
+ 	SPHAERO_REG_CMD_MAX,
+ };
+ 
+ 
+-#define DRM_SPHAERO_NUM_IOCTLS 5
++#define DRM_SPHAERO_NUM_IOCTLS 7
+ 
+ static const struct pci_device_id pci_table[] = {
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_SPHAERO, PCI_DEVICE_ID_SPHAERO), },
+ 	{ },
+ };
+ 
++
++// FIXME: Threading is completely ignored by our driver at the moment
+ struct sphaero_priv {
+ 	volatile uint32_t __iomem* regs;
+ 	struct drm_connector connector;
+ 	struct drm_encoder encoder;
+ 	struct drm_crtc crtc;
++	uint64_t hw_id;
+ };
+ 
+ static void sphaero_conn_destroy(struct drm_connector *connector) {
+ 	// destroy function is called unguarded, and there are no existing
+@@ -195,11 +201,43 @@ static int sphaero_do_size_prefixed_gem_xfer(struct sphaero_priv* priv, struct d
+ 	sphaero_gpu_send_elem_size(priv, size_cmd, size);
+ 	return sphaero_do_gem_xfer(priv, gem_obj, chunk_cmd, true);
+ }
+ 
++struct drm_gem_sphaero_obj {
++	struct drm_gem_object base;
++	uint64_t hw_id;
++};
++
++static void sphaero_gem_object_free(struct drm_gem_object *obj) {
++	struct drm_gem_sphaero_obj* sphaero_obj = container_of(obj, struct drm_gem_sphaero_obj, base);
++	kfree(sphaero_obj);
++}
++
++static const struct drm_gem_object_funcs sphaero_gem_funcs = {
++	.free = sphaero_gem_object_free
++};
++
++static struct drm_gem_sphaero_obj* drm_gem_sphaero_create(struct drm_device* dev, size_t size) {
++	struct sphaero_priv *priv = dev->dev_private;
++
++	struct drm_gem_sphaero_obj *sphaero_obj = kzalloc(sizeof(*sphaero_obj), GFP_KERNEL);
++	if (!sphaero_obj)
++		return ERR_PTR(-ENOMEM);
++
++	int rc = drm_gem_object_init(dev, &sphaero_obj->base, size);
++	if (rc) {
++		goto err;
++	}
++	sphaero_obj->base.funcs = &sphaero_gem_funcs;
++	sphaero_obj->hw_id = priv->hw_id++;
++	return sphaero_obj;
++err:
++	kfree(sphaero_obj);
++	return ERR_PTR(rc);
++}
++
+ static void sphaero_gpu_plane_update(struct drm_plane *plane,
+ 		      struct drm_atomic_state *state) {
+-
+ 	struct drm_device* drm_dev = plane->dev;
+ 	struct sphaero_priv* priv = drm_dev->dev_private;
+ 
+ 	if (plane == NULL || plane->state == NULL || plane->state->fb == NULL) {
+@@ -207,10 +245,23 @@ static void sphaero_gpu_plane_update(struct drm_plane *plane,
+ 		return;
+ 	}
+ 
+ 	struct drm_gem_object* gem_obj = plane->state->fb->obj[0];
+-	sphaero_do_gem_xfer(priv, gem_obj, SPHAERO_REG_CMD_PUSH_FB_CHUNK, true);
+-	priv->regs[0] = SPHAERO_REG_CMD_COMMIT_FB;
++
++	if (gem_obj->funcs == &sphaero_gem_funcs) {
++		struct drm_gem_sphaero_obj* sphaero_obj = container_of(gem_obj, struct drm_gem_sphaero_obj, base);
++		priv->regs[1] = sphaero_obj->hw_id;
++		priv->regs[2] = sphaero_obj->hw_id >> 32;
++		priv->regs[0] = SPHAERO_REG_CMD_SET_HW_FB;
++		return;
++	} else {
++		// We have not yet implemented mmap for hardware backed buffers,
++		// which means the DUMB workflow cannot be supported by our object.
++		sphaero_do_gem_xfer(priv, gem_obj, SPHAERO_REG_CMD_PUSH_FB_CHUNK, true);
++		priv->regs[0] = SPHAERO_REG_CMD_COMMIT_FB;
++		return;
++	}
++
+ }
+ 
+ static const struct drm_plane_helper_funcs sphaero_gpu_primary_helper_funcs = {
+ 	.atomic_update		= sphaero_gpu_plane_update,
+@@ -446,8 +497,51 @@ static int sphaero_gpu_upload_transform_ioctl(struct drm_device *dev, void *data
+ 	return sphaero_gpu_upload_ioctl_unsized(dev, data, file, SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM);
+ }
+ 
+ 
++static int sphaero_gpu_create_gl_tex_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file) {
++	struct drm_gem_sphaero_obj *obj = drm_gem_sphaero_create(dev, 0 /*No way to map to userspace*/);
++	if (IS_ERR(obj)) {
++		return PTR_ERR(obj);
++	}
++	struct sphaero_priv* priv = dev->dev_private;
++	struct drm_sphaero_create_gl_tex *params = data;
++	priv->regs[1] = obj->hw_id;
++	priv->regs[2] = obj->hw_id >> 32;
++	priv->regs[3] = params->width;
++	priv->regs[4] = params->height;
++	priv->regs[0] = SPHAERO_REG_CMD_CREATE_GL_TEX;
++	drm_gem_handle_create(file, &obj->base, &params->handle);
++
++	// Handle increases reference count, we need to release our ref
++	drm_gem_object_put(&obj->base);
++	return 0;
++}
++
++static int sphaero_gpu_gl_clear_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file) {
++	struct sphaero_priv* priv = dev->dev_private;
++	struct drm_sphaero_gl_clear *params = data;
++	struct drm_gem_object* obj = drm_gem_object_lookup(file, params->handle);
++	struct drm_gem_sphaero_obj* sphaero_obj = container_of(obj, struct drm_gem_sphaero_obj, base);
++	priv->regs[1] = sphaero_obj->hw_id;
++	priv->regs[2] = sphaero_obj->hw_id >> 32;
++	priv->regs[3] = params->color[0];
++	priv->regs[4] = params->color[1];
++	priv->regs[5] = params->color[2];
++	priv->regs[6] = params->color[3];
++	priv->regs[7] = params->minx;
++	priv->regs[8] = params->maxx;
++	priv->regs[9] = params->miny;
++	priv->regs[10] = params->maxy;
++	priv->regs[0] = SPHAERO_REG_CMD_GL_CLEAR;
++
++	// FIXME: GPU needs to tell us when it is done with the texture so we can release it or something
++
++	return 0;
++}
++
+ struct drm_ioctl_desc sphaero_gpu_ioctls[DRM_SPHAERO_NUM_IOCTLS] = {
+ 	DRM_IOCTL_DEF_DRV(SPHAERO_CREATE_GPU_OBJ, sphaero_gpu_create_gpu_obj_ioctl,
+ 			  DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(SPHAERO_MAP_GPU_OBJ, sphaero_gpu_map_gpu_obj_ioctl,
+@@ -457,9 +551,14 @@ struct drm_ioctl_desc sphaero_gpu_ioctls[DRM_SPHAERO_NUM_IOCTLS] = {
+ 	DRM_IOCTL_DEF_DRV(SPHAERO_UPLOAD_TEXTURE, sphaero_gpu_upload_texture_ioctl,
+ 			  DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(SPHAERO_UPLOAD_TRANSFORM, sphaero_gpu_upload_transform_ioctl,
+ 			  DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(SPHAERO_CREATE_GL_TEX, sphaero_gpu_create_gl_tex_ioctl,
++			  DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(SPHAERO_GL_CLEAR, sphaero_gpu_gl_clear_ioctl,
++			  DRM_RENDER_ALLOW),
+ };
++
+ static const struct drm_driver driver = {
+ 	/*
+ 	 * If KMS is disabled DRIVER_MODESET and DRIVER_ATOMIC are masked
+ 	 * out via drm_device::driver_features:
+diff --git a/include/uapi/drm/sphaero_drm.h b/include/uapi/drm/sphaero_drm.h
+index 7501b46ee..9060a758c 100644
+--- a/include/uapi/drm/sphaero_drm.h
++++ b/include/uapi/drm/sphaero_drm.h
+@@ -11,8 +11,10 @@ extern "C" {
+ #define DRM_SPHAERO_MAP_GPU_OBJ  0x01
+ #define DRM_SPHAERO_UPLOAD_VB  0x02
+ #define DRM_SPHAERO_UPLOAD_TEXTURE  0x03
+ #define DRM_SPHAERO_UPLOAD_TRANSFORM  0x04
++#define DRM_SPHAERO_CREATE_GL_TEX 0x05
++#define DRM_SPHAERO_GL_CLEAR 0x06
+ 
+ struct drm_sphaero_create_gpu_obj {
+ 	// inputs
+ 	__u64 size;
+@@ -33,8 +35,27 @@ struct drm_sphaero_upload_gpu_obj {
+ 	__u64 size;
+ 	__u32 handle;
+ };
+ 
++struct drm_sphaero_create_gl_tex {
++	// inputs
++	__u32 width;
++	__u32 height;
++
++	// outputs
++	__u32 handle;
++};
++
++struct drm_sphaero_gl_clear {
++	// inputs
++	__u32 handle;
++	__u32 color[4]; // f32s bitcast to u32s
++	__u32 minx;
++	__u32 maxx;
++	__u32 miny;
++	__u32 maxy;
++};
++
+ #define DRM_IOCTL_SPHAERO_CREATE_GPU_OBJ \
+ 	DRM_IOWR(DRM_COMMAND_BASE + DRM_SPHAERO_CREATE_GPU_OBJ,\
+ 		struct drm_sphaero_create_gpu_obj)
+ 
+@@ -53,8 +74,16 @@ struct drm_sphaero_upload_gpu_obj {
+ #define DRM_IOCTL_SPHAERO_UPLOAD_TRANSFORM \
+ 	DRM_IOWR(DRM_COMMAND_BASE + DRM_SPHAERO_UPLOAD_TRANSFORM,\
+ 		struct drm_sphaero_upload_gpu_obj)
+ 
++#define DRM_IOCTL_SPHAERO_CREATE_GL_TEX \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_SPHAERO_CREATE_GL_TEX,\
++		struct drm_sphaero_create_gl_tex)
++
++#define DRM_IOCTL_SPHAERO_GL_CLEAR \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_SPHAERO_GL_CLEAR,\
++		struct drm_sphaero_gl_clear)
++
+ #if defined(__cplusplus)
+ }
+ #endif
+ 
+-- 
+2.44.1
+
