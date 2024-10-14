@@ -1,0 +1,276 @@
+From 81557d8cd95c2f43e2c9ce44a67172249c3b82cf Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 14 Oct 2024 13:24:09 -0700
+Subject: [PATCH] Refactor GPU API
+
+Previously each command got its own set of registers. This results in a
+lot of code churn for every new API. As we implement more APIs for
+OpenGL support this will become more and more painful. Use one common
+API for setting a command, and allow each command to interpret
+"argument" registers as they please
+---
+ hw/misc/sphaero.c | 203 ++++++++++++++++++----------------------------
+ 1 file changed, 78 insertions(+), 125 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index 56ec6b1b8..f103f6cc9 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -9,24 +9,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(SphaeroState, SPHAERO)
+ #define SPHAERO_OUTPUT_HEIGHT 768
+ #define NUM_PIXELS (SPHAERO_OUTPUT_WIDTH * SPHAERO_OUTPUT_HEIGHT)
+ #define PIXELS_SIZE (NUM_PIXELS * 4)
+ 
+-// NOTE: 0 is not reserved, just was used in testing and never fixed
+-#define SPHAERO_REG_FB_ADDR_LOW 1
+-#define SPHAERO_REG_FB_ADDR_HIGH 2
+-#define SPHAERO_REG_FB_SIZE_LOW 3
+-#define SPHAERO_REG_FB_SIZE_HIGH 4
+-#define SPHAERO_REG_FB_COMMIT_FRAME 5
+-#define SPHAERO_REG_VB_ADDR_LOW 6
+-#define SPHAERO_REG_VB_ADDR_HIGH 7
+-#define SPHAERO_REG_VB_SIZE_LOW 8
+-#define SPHAERO_REG_VB_SIZE_HIGH 9
+-#define SPHAERO_REG_TEXTURE_ADDR_LOW 10
+-#define SPHAERO_REG_TEXTURE_ADDR_HIGH 11
+-#define SPHAERO_REG_TEXTURE_SIZE_LOW 12
+-#define SPHAERO_REG_TEXTURE_SIZE_HIGH 13
+-#define SPHAERO_REG_MODEL_TRANSFORM_ADDR_LOW 14
+-#define SPHAERO_REG_MODEL_TRANSFORM_ADDR_HIGH 15
++typedef enum SphaeroRegCommand {
++    SPHAERO_REG_CMD_PUSH_FB_CHUNK,
++    SPHAERO_REG_CMD_COMMIT_FB,
++    SPHAERO_REG_CMD_SET_VB_SIZE,
++    SPHAERO_REG_CMD_PUSH_VB_CHUNK,
++    SPHAERO_REG_CMD_SET_TEXTURE_SIZE,
++    SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK,
++    SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM,
++    SPHAERO_REG_CMD_MAX,
++} SphaeroRegCommand;
++
++#define SPHAERO_NUM_ARG_REGS 4
+ 
+ #define SPHAERO_TRANSFORM_SIZE (16 * sizeof(float))
+ 
+ typedef struct SphaeroPushBuf {
+@@ -212,16 +208,9 @@ typedef struct SphaeroState
+     MemoryRegion bar;
+ 
+     QemuConsole* console;
+ 
+-    uint64_t dma_address;
+-    uint64_t dma_len;
+-
+-    uint64_t vb_address;
+-    uint64_t vb_len;
+-
+-    uint64_t texture_address;
+-    uint64_t texture_len;
++    uint32_t args[SPHAERO_NUM_ARG_REGS];
+ 
+     uint64_t transform_address;
+ 
+     struct SphaeroVbProtected {
+@@ -277,134 +266,98 @@ static void sphaero_commit_frame(SphaeroState* s) {
+ 
+     sphaero_swap_pixel_buf(s);
+ }
+ 
+-static void sphaero_replace_low(uint32_t in, uint64_t* out) {
+-    *out &= 0xffffffff00000000;
+-    *out |= in;
+-}
+-
+-static void sphaero_replace_high(uint32_t in, uint64_t* out) {
+-    *out &= 0x00000000ffffffff;
+-    uint64_t in_u64 = in;
+-    *out |= in_u64 << 32;
+-}
+-
+-static void replace_low(uint32_t in, uint64_t* out) {
+-    *out &= 0xffffffff00000000;
+-    *out |= in;
+-}
+-
+-static void replace_high(uint32_t in, uint64_t* out) {
+-    *out &= 0x00000000ffffffff;
+-    uint64_t in_u64 = in;
+-    *out |= in_u64 << 32;
++static bool sphaero_is_little_endian(void) {
++    int n = 1;
++    // little endian if true
++    return *(char *)&n == 1;
+ }
+ 
+-
+-static void sphaero_write(void *opaque,
+-                  hwaddr addr,
+-                  uint64_t data,
+-                  unsigned size) {
+-    SphaeroState* s = opaque;
+-    hwaddr reg = addr / 4;
+-    switch (reg) {
+-        case SPHAERO_REG_FB_ADDR_LOW: {
+-            sphaero_replace_low(data, &s->dma_address);
++static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
++    switch (cmd) {
++        case SPHAERO_REG_CMD_PUSH_FB_CHUNK: {
++            assert(sphaero_is_little_endian());
++            uint64_t *dma_address = (uint64_t*)s->args;
++            uint64_t *dma_len = (uint64_t*)(s->args + 2);
++            sphaero_do_dma(*dma_address, *dma_len, sphaero_push_buf_push_data_cb, &s->pixels[s->display_idx]);
+             break;
+         }
+-        case SPHAERO_REG_FB_ADDR_HIGH: {
+-            sphaero_replace_high(data, &s->dma_address);
+-            break;
+-        }
+-        case SPHAERO_REG_FB_SIZE_LOW: {
+-            sphaero_replace_low(data, &s->dma_len);
+-            break;
+-        }
+-        case SPHAERO_REG_FB_SIZE_HIGH: {
+-            sphaero_replace_high(data, &s->dma_len);
+-            sphaero_do_dma(s->dma_address, s->dma_len, sphaero_push_buf_push_data_cb, &s->pixels[s->display_idx]);
+-            break;
+-        }
+-        case SPHAERO_REG_FB_COMMIT_FRAME: {
++        case SPHAERO_REG_CMD_COMMIT_FB: {
+             sphaero_commit_frame(s);
+             break;
+         }
+-        case SPHAERO_REG_VB_ADDR_LOW: {
+-            replace_low(data, &s->vb_address);
+-            break;
+-        }
+-        case SPHAERO_REG_VB_ADDR_HIGH: {
+-            replace_high(data, &s->vb_address);
+-            break;
+-        }
+-        case SPHAERO_REG_VB_SIZE_LOW: {
+-            replace_low(data, &s->vb_len);
+-            break;
+-        }
+-        case SPHAERO_REG_VB_SIZE_HIGH: {
+-            replace_high(data, &s->vb_len);
+-
+-            if (s->vb_address == 0) {
+-                qemu_mutex_lock(&s->render_protected.lock);
+-
+-                sphaero_push_buf_free(&s->render_protected.vb);
+-                s->render_protected.vb = sphaero_push_buf_create(s->vb_len);
+-
+-                qemu_mutex_unlock(&s->render_protected.lock);
++        case SPHAERO_REG_CMD_SET_VB_SIZE: {
++            qemu_mutex_lock(&s->render_protected.lock);
++            assert(sphaero_is_little_endian());
++            uint64_t *vb_len = (uint64_t*)(s->args);
+ 
+-                break;
+-            }
++            sphaero_push_buf_free(&s->render_protected.vb);
++            s->render_protected.vb = sphaero_push_buf_create(*vb_len);
+ 
+-            qemu_mutex_lock(&s->render_protected.lock);
+-            sphaero_do_dma(s->vb_address, s->vb_len, sphaero_push_buf_push_data_cb, &s->render_protected.vb);
+             qemu_mutex_unlock(&s->render_protected.lock);
+             break;
+         }
+-        case SPHAERO_REG_TEXTURE_ADDR_LOW: {
+-            replace_low(data, &s->texture_address);
+-            break;
+-        }
+-        case SPHAERO_REG_TEXTURE_ADDR_HIGH: {
+-            replace_high(data, &s->texture_address);
+-            break;
+-        }
+-        case SPHAERO_REG_TEXTURE_SIZE_LOW: {
+-            replace_low(data, &s->texture_len);
++        case SPHAERO_REG_CMD_PUSH_VB_CHUNK: {
++            assert(sphaero_is_little_endian());
++            uint64_t *dma_address = (uint64_t*)s->args;
++            uint64_t *dma_len = (uint64_t*)(s->args + 2);
++
++            qemu_mutex_lock(&s->render_protected.lock);
++            sphaero_do_dma(*dma_address, *dma_len, sphaero_push_buf_push_data_cb, &s->render_protected.vb);
++            qemu_mutex_unlock(&s->render_protected.lock);
+             break;
+         }
+-        case SPHAERO_REG_TEXTURE_SIZE_HIGH: {
+-            replace_high(data, &s->texture_len);
+-
+-            if (s->texture_address == 0) {
+-                qemu_mutex_lock(&s->render_protected.lock);
+-
+-                sphaero_push_buf_free(&s->render_protected.texture);
+-                s->render_protected.texture = sphaero_push_buf_create(s->texture_len);
++        case SPHAERO_REG_CMD_SET_TEXTURE_SIZE: {
++            assert(sphaero_is_little_endian());
++            uint64_t *tex_len = (uint64_t*)(s->args);
++            qemu_mutex_lock(&s->render_protected.lock);
+ 
+-                qemu_mutex_unlock(&s->render_protected.lock);
++            sphaero_push_buf_free(&s->render_protected.texture);
++            s->render_protected.texture = sphaero_push_buf_create(*tex_len);
+ 
+-                break;
+-            }
++            qemu_mutex_unlock(&s->render_protected.lock);
++            break;
++        }
++        case SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK: {
++            assert(sphaero_is_little_endian());
++            uint64_t *dma_address = (uint64_t*)s->args;
++            uint64_t *dma_len = (uint64_t*)(s->args + 2);
+ 
+             qemu_mutex_lock(&s->render_protected.lock);
+ 
+-            sphaero_do_dma(s->texture_address, s->texture_len, sphaero_push_buf_push_data_cb, &s->render_protected.texture);
++            sphaero_do_dma(*dma_address, *dma_len, sphaero_push_buf_push_data_cb, &s->render_protected.texture);
+             qemu_mutex_unlock(&s->render_protected.lock);
+             break;
+         }
+-        case SPHAERO_REG_MODEL_TRANSFORM_ADDR_LOW: {
+-            replace_low(data, &s->transform_address);
+-            break;
+-        }
+-        case SPHAERO_REG_MODEL_TRANSFORM_ADDR_HIGH: {
+-            replace_high(data, &s->transform_address);
+-            sphaero_do_dma(s->transform_address, SPHAERO_TRANSFORM_SIZE, memcpy_cb, s->render_protected.transform);
++        case SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM:
++            assert(sphaero_is_little_endian());
++            uint64_t *dma_address = (uint64_t*)s->args;
++            qemu_mutex_lock(&s->render_protected.lock);
++            sphaero_do_dma(*dma_address, SPHAERO_TRANSFORM_SIZE, memcpy_cb, s->render_protected.transform);
++            qemu_mutex_unlock(&s->render_protected.lock);
+             break;
+-        }
++        case SPHAERO_REG_CMD_MAX:
++            assert(false);
++            return;
++    }
++}
+ 
+-        default: break;
++static void sphaero_write(void *opaque,
++                  hwaddr addr,
++                  uint64_t data,
++                  unsigned size) {
++    SphaeroState* s = opaque;
++    hwaddr reg = addr / 4;
++    if (reg == 0) {
++        if (reg >= SPHAERO_REG_CMD_MAX) {
++            return;
++        }
++        sphaero_run_command(s, data);
++        return;
+     }
++
++    s->args[reg - 1] = data;
+ }
+ 
+ 
+ static uint64_t sphaero_read(void *opaque,
+-- 
+2.44.1
+

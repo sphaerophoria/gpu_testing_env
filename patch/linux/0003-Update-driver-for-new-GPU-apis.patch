@@ -1,0 +1,177 @@
+From c4eefa9dc9b5f07c9cb176fd924f585ed9809bda Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 14 Oct 2024 13:26:16 -0700
+Subject: [PATCH] Update driver for new GPU apis
+
+See qemu patch for more details
+---
+ drivers/gpu/drm/sphaero/sphaero_drv.c | 69 +++++++++++++--------------
+ 1 file changed, 34 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/sphaero/sphaero_drv.c b/drivers/gpu/drm/sphaero/sphaero_drv.c
+index 2c97e2498..d2cdcd1fc 100644
+--- a/drivers/gpu/drm/sphaero/sphaero_drv.c
++++ b/drivers/gpu/drm/sphaero/sphaero_drv.c
+@@ -27,23 +27,18 @@ static const struct drm_driver driver;
+ #define PCI_DEVICE_ID_SPHAERO	0xaaaa
+ #define SPHAERO_SUPPORTED_BITS_PER_PIX 32
+ #define SPHAERO_BYTES_PER_PIX (SPHAERO_SUPPORTED_BITS_PER_PIX / 8)
+ 
+-#define SPHAERO_REG_FB_ADDR_LOW 1
+-#define SPHAERO_REG_FB_ADDR_HIGH 2
+-#define SPHAERO_REG_FB_SIZE_LOW 3
+-#define SPHAERO_REG_FB_SIZE_HIGH 4
+-#define SPHAERO_REG_FB_COMMIT_FRAME 5
+-#define SPHAERO_REG_VB_ADDR_LOW 6
+-#define SPHAERO_REG_VB_ADDR_HIGH 7
+-#define SPHAERO_REG_VB_SIZE_LOW 8
+-#define SPHAERO_REG_VB_SIZE_HIGH 9
+-#define SPHAERO_REG_TEXTURE_ADDR_LOW 10
+-#define SPHAERO_REG_TEXTURE_ADDR_HIGH 11
+-#define SPHAERO_REG_TEXTURE_SIZE_LOW 12
+-#define SPHAERO_REG_TEXTURE_SIZE_HIGH 13
+-#define SPHAERO_REG_MODEL_TRANSFORM_ADDR_LOW 14
+-#define SPHAERO_REG_MODEL_TRANSFORM_ADDR_HIGH 15
++enum sphaero_reg_cmd {
++    SPHAERO_REG_CMD_PUSH_FB_CHUNK,
++    SPHAERO_REG_CMD_COMMIT_FB,
++    SPHAERO_REG_CMD_SET_VB_SIZE,
++    SPHAERO_REG_CMD_PUSH_VB_CHUNK,
++    SPHAERO_REG_CMD_SET_TEXTURE_SIZE,
++    SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK,
++    SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM,
++    SPHAERO_REG_CMD_MAX,
++};
+ 
+ 
+ #define DRM_SPHAERO_NUM_IOCTLS 5
+ 
+@@ -159,9 +154,9 @@ static const struct drm_plane_funcs sphaero_gpu_plane_funcs = {
+ 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+ 	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
+ };
+ 
+-static int sphaero_do_gem_xfer(struct sphaero_priv* priv, struct drm_gem_object* gem_obj, uint32_t base_reg, bool with_chunk_len) {
++static int sphaero_do_gem_xfer(struct sphaero_priv* priv, struct drm_gem_object* gem_obj, enum sphaero_reg_cmd cmd, bool with_chunk_len) {
+ 	struct drm_gem_shmem_object* shmem_obj = container_of(gem_obj, struct drm_gem_shmem_object, base);
+ 	// It seems like we are leaking a locked resource here, and we kinda
+ 	// are, however the table is held as a member of shmem_obj and re-used
+ 	// on future mappings. It seems like the model here is that if we are
+@@ -176,26 +171,30 @@ static int sphaero_do_gem_xfer(struct sphaero_priv* priv, struct drm_gem_object*
+ 	int si;
+ 	for_each_sgtable_dma_sg(sg_table, sg, si) {
+ 		u64 dma_addr = sg_dma_address(sg);
+ 		u64 dma_length = sg_dma_len(sg);
+-		priv->regs[base_reg]  = cpu_to_le32(dma_addr);
+-		priv->regs[base_reg + 1] = cpu_to_le32(dma_addr >> 32);
++		priv->regs[1]  = cpu_to_le32(dma_addr);
++		priv->regs[2] = cpu_to_le32(dma_addr >> 32);
+ 		if (with_chunk_len) {
+-			priv->regs[base_reg + 2]  = cpu_to_le32(dma_length);
+-			priv->regs[base_reg + 3] = cpu_to_le32(dma_length >> 32);
++			priv->regs[3]  = cpu_to_le32(dma_length);
++			priv->regs[4] = cpu_to_le32(dma_length >> 32);
+ 		}
++		priv->regs[0] = cmd;
+ 	}
+ 	return 0;
+ }
+ 
+-static int sphaero_do_size_prefixed_gem_xfer(struct sphaero_priv* priv, struct drm_gem_object* gem_obj, uint32_t base_reg, uint64_t size) {
++static void sphaero_gpu_send_elem_size(struct sphaero_priv* priv, enum sphaero_reg_cmd cmd, u64 size) {
++	priv->regs[1] = size;
++	priv->regs[2] = size >> 32;
++	priv->regs[0] = cmd;
++}
++
+ 
+-	priv->regs[base_reg]  = 0;
+-	priv->regs[base_reg + 1] = 0;
+-	priv->regs[base_reg + 2]  = size;
+-	priv->regs[base_reg + 3] = size >> 32;
++static int sphaero_do_size_prefixed_gem_xfer(struct sphaero_priv* priv, struct drm_gem_object* gem_obj, enum sphaero_reg_cmd size_cmd, enum sphaero_reg_cmd chunk_cmd, uint64_t size) {
+ 
+-	return sphaero_do_gem_xfer(priv, gem_obj, base_reg, true);
++	sphaero_gpu_send_elem_size(priv, size_cmd, size);
++	return sphaero_do_gem_xfer(priv, gem_obj, chunk_cmd, true);
+ }
+ 
+ static void sphaero_gpu_plane_update(struct drm_plane *plane,
+ 		      struct drm_atomic_state *state) {
+@@ -208,10 +207,10 @@ static void sphaero_gpu_plane_update(struct drm_plane *plane,
+ 		return;
+ 	}
+ 
+ 	struct drm_gem_object* gem_obj = plane->state->fb->obj[0];
+-	sphaero_do_gem_xfer(priv, gem_obj, SPHAERO_REG_FB_ADDR_LOW, true);
+-	priv->regs[SPHAERO_REG_FB_COMMIT_FRAME] = 0;
++	sphaero_do_gem_xfer(priv, gem_obj, SPHAERO_REG_CMD_PUSH_FB_CHUNK, true);
++	priv->regs[0] = SPHAERO_REG_CMD_COMMIT_FB;
+ }
+ 
+ static const struct drm_plane_helper_funcs sphaero_gpu_primary_helper_funcs = {
+ 	.atomic_update		= sphaero_gpu_plane_update,
+@@ -399,43 +398,43 @@ static int sphaero_gpu_map_gpu_obj_ioctl(struct drm_device *dev, void *data,
+ 	return 0;
+ }
+ 
+ static int sphaero_gpu_upload_ioctl_sized(struct drm_device *dev, void *data,
+-				struct drm_file *file, uint32_t base_reg) {
++				struct drm_file *file, enum sphaero_reg_cmd size_cmd, enum sphaero_reg_cmd chunk_cmd) {
+ 	struct drm_sphaero_upload_gpu_obj *params = data;
+ 	struct sphaero_priv* priv = dev->dev_private;
+ 	struct drm_gem_object *gobj = drm_gem_object_lookup(file, params->handle);
+ 	if (!gobj) {
+ 		return -ENOENT;
+ 	}
+ 
+-	int rc = sphaero_do_size_prefixed_gem_xfer(priv, gobj, base_reg, params->size);
++	int rc = sphaero_do_size_prefixed_gem_xfer(priv, gobj, size_cmd, chunk_cmd, params->size);
+ 	drm_gem_object_put(gobj);
+ 	return rc;
+ }
+ 
+ static int sphaero_gpu_upload_ioctl_unsized(struct drm_device *dev, void *data,
+-				struct drm_file *file, uint32_t base_reg) {
++				struct drm_file *file, enum sphaero_reg_cmd cmd) {
+ 	struct drm_sphaero_upload_gpu_obj *params = data;
+ 	struct sphaero_priv* priv = dev->dev_private;
+ 	struct drm_gem_object *gobj = drm_gem_object_lookup(file, params->handle);
+ 	if (!gobj) {
+ 		return -ENOENT;
+ 	}
+ 
+-	int rc = sphaero_do_gem_xfer(priv, gobj, base_reg, false);
++	int rc = sphaero_do_gem_xfer(priv, gobj, cmd, false);
+ 	drm_gem_object_put(gobj);
+ 	return rc;
+ }
+ 
+ static int sphaero_gpu_upload_vb_ioctl(struct drm_device *dev, void *data,
+ 				struct drm_file *file) {
+-	return sphaero_gpu_upload_ioctl_sized(dev, data, file, SPHAERO_REG_VB_ADDR_LOW);
++	return sphaero_gpu_upload_ioctl_sized(dev, data, file, SPHAERO_REG_CMD_SET_VB_SIZE, SPHAERO_REG_CMD_PUSH_VB_CHUNK);
+ }
+ 
+ static int sphaero_gpu_upload_texture_ioctl(struct drm_device *dev, void *data,
+ 				struct drm_file *file) {
+-	return sphaero_gpu_upload_ioctl_sized(dev, data, file, SPHAERO_REG_TEXTURE_ADDR_LOW);
++	return sphaero_gpu_upload_ioctl_sized(dev, data, file, SPHAERO_REG_CMD_SET_TEXTURE_SIZE, SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK);
+ }
+ 
+ static int sphaero_gpu_upload_transform_ioctl(struct drm_device *dev, void *data,
+                                struct drm_file *file) {
+@@ -443,9 +442,9 @@ static int sphaero_gpu_upload_transform_ioctl(struct drm_device *dev, void *data
+        if (params->size != 16 * 4) {
+ 	       return -EINVAL;
+        }
+ 
+-       return sphaero_gpu_upload_ioctl_unsized(dev, data, file, SPHAERO_REG_MODEL_TRANSFORM_ADDR_LOW);
++       return sphaero_gpu_upload_ioctl_unsized(dev, data, file, SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM);
+ }
+ 
+ 
+ struct drm_ioctl_desc sphaero_gpu_ioctls[DRM_SPHAERO_NUM_IOCTLS] = {
+-- 
+2.44.1
+
