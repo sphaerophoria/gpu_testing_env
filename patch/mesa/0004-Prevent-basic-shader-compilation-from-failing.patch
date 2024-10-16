@@ -1,0 +1,167 @@
+From b2669a60d557a6da37a1318589d333425785e36b Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Sat, 19 Oct 2024 19:31:01 +0000
+Subject: [PATCH 4/6] Prevent basic shader compilation from failing
+
+Given a test app with a simple passthrough vertex shader and constant
+fragment shaders, stub out functions until there are no more segfaults
+---
+ .../winsys/sphaero/drm/sphaero_drm_winsys.c   | 114 +++++++++++++++++-
+ 1 file changed, 113 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+index 581659b..7b1c8d1 100644
+--- a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
++++ b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+@@ -45,13 +45,29 @@ sphaero_drm_get_shader_param(struct pipe_screen *screen,
+             default: break;
+          }
+          break;
+       };
++      case PIPE_SHADER_VERTEX: {
++          switch (param) {
++            case PIPE_SHADER_CAP_MAX_INPUTS: {
++               return 1;
++            }
++
++            default: break;
++          }
++          break;
++      }
+       default: break;
+    }
+    return 0;
+ }
+ 
++static void *sphaero_ctx_create_shader_state(struct pipe_context *ctx,
++                                      const struct pipe_shader_state *state)
++{
++   return MALLOC(1);
++}
++
+ static bool sphaero_drm_is_format_supported(struct pipe_screen *screen,
+                             enum pipe_format format,
+                             enum pipe_texture_target target,
+                             unsigned sample_count,
+@@ -159,8 +175,87 @@ static void sphaero_ctx_flush_resource(struct pipe_context *ctx,
+                        struct pipe_resource *resource) {
+ 
+ }
+ 
++static void sphaero_ctx_buffer_subdata(struct pipe_context * pc,
++                       struct pipe_resource * pr,
++                       unsigned usage, /* a combination of PIPE_MAP_x */
++                       unsigned offset,
++                       unsigned size,
++                       const void *data) {
++   // vertex data upload probably
++   printf("Uploading vertex data of size %u\n", size);
++   printf("Data if interprted as floats...\n");
++   const float* data_f = data;
++   for (int i = 0; i < size / 4; ++i) {
++      printf("%f ", data_f[i]);
++   }
++   printf("\n");
++}
++
++static void* sphaero_ctx_create_depth_stencil_alpha_state(struct pipe_context * pc,
++                                     const struct pipe_depth_stencil_alpha_state * as) {
++   return MALLOC(1);
++}
++
++static void sphaero_ctx_bind_depth_stencil_alpha_state(struct pipe_context * pc, void * state) {
++}
++
++static void   sphaero_ctx_bind_fs_state(struct pipe_context * pc , void * state) {}
++
++static void   sphaero_ctx_bind_vs_state(struct pipe_context * pc, void * state ) {}
++static void sphaero_ctx_set_polygon_stipple(struct pipe_context * pc,
++                            const struct pipe_poly_stipple * stipple) {
++   // ????
++}
++static void sphaero_ctx_set_blend_color(struct pipe_context * pc,
++                        const struct pipe_blend_color * color) {}
++
++static void * sphaero_ctx_create_blend_state(struct pipe_context * pc,
++                             const struct pipe_blend_state * state) {
++   return MALLOC(1);
++}
++
++static void sphaero_ctx_bind_blend_state(struct pipe_context * pc, void * state) {}
++
++static void * sphaero_ctx_create_rasterizer_state(struct pipe_context * pc,
++                                  const struct pipe_rasterizer_state * state) {
++   return MALLOC(1);
++}
++
++static void sphaero_ctx_bind_rasterizer_state(struct pipe_context * pc, void *state) {}
++
++static void sphaero_ctx_set_viewport_states(struct pipe_context *pc,
++                            unsigned start_slot,
++                            unsigned num_viewports,
++                            const struct pipe_viewport_state * states) {
++
++}
++
++static void * sphaero_ctx_create_vertex_elements_state(struct pipe_context * pc,
++                                       unsigned num_elements,
++                                       const struct pipe_vertex_element * input) {
++   return MALLOC(1);
++}
++
++static void sphaero_ctx_bind_vertex_elements_state(struct pipe_context * pc, void * state) {}
++
++static void sphaero_ctx_set_vertex_buffers(struct pipe_context *pc,
++                           unsigned num_buffers,
++                           unsigned unbind_num_trailing_slots,
++                           bool take_ownership,
++                           const struct pipe_vertex_buffer * vertex_buffers) {
++
++}
++
++static void sphaero_ctx_draw_vbo(struct pipe_context *pipe,
++                               const struct pipe_draw_info *info,
++                               unsigned drawid_offset,
++                               const struct pipe_draw_indirect_info *indirect,
++                               const struct pipe_draw_start_count_bias *draws,
++                               unsigned num_draws) {
++}
++
+ static struct pipe_context* sphaero_context_create(struct pipe_screen *screen,
+                                         void *priv, unsigned flags) {
+    struct sphaero_context* ctx = CALLOC_STRUCT(sphaero_context);
+    ctx->pc.screen = screen;
+@@ -169,12 +264,29 @@ static struct pipe_context* sphaero_context_create(struct pipe_screen *screen,
+    ctx->pc.set_framebuffer_state = sphaero_ctx_set_framebuffer_state;
+    ctx->pc.clear = sphaero_ctx_clear;
+    ctx->pc.flush = sphaero_ctx_flush;
+    ctx->pc.flush_resource = sphaero_ctx_flush_resource;
++   ctx->pc.create_vs_state = sphaero_ctx_create_shader_state;
++   ctx->pc.create_fs_state = sphaero_ctx_create_shader_state;
++   ctx->pc.buffer_subdata = sphaero_ctx_buffer_subdata;
++   ctx->pc.create_depth_stencil_alpha_state = sphaero_ctx_create_depth_stencil_alpha_state;
++   ctx->pc.bind_depth_stencil_alpha_state = sphaero_ctx_bind_depth_stencil_alpha_state;
++   ctx->pc.bind_fs_state = sphaero_ctx_bind_fs_state;
++   ctx->pc.bind_vs_state = sphaero_ctx_bind_vs_state;
++   ctx->pc.set_polygon_stipple = sphaero_ctx_set_polygon_stipple;
++   ctx->pc.set_blend_color = sphaero_ctx_set_blend_color;
++   ctx->pc.create_blend_state = sphaero_ctx_create_blend_state;
++   ctx->pc.bind_blend_state = sphaero_ctx_bind_blend_state;
++   ctx->pc.create_rasterizer_state = sphaero_ctx_create_rasterizer_state;
++   ctx->pc.bind_rasterizer_state = sphaero_ctx_bind_rasterizer_state;
++   ctx->pc.set_viewport_states = sphaero_ctx_set_viewport_states;
++   ctx->pc.create_vertex_elements_state = sphaero_ctx_create_vertex_elements_state;
++   ctx->pc.bind_vertex_elements_state = sphaero_ctx_bind_vertex_elements_state;
++   ctx->pc.set_vertex_buffers = sphaero_ctx_set_vertex_buffers;
++   ctx->pc.draw_vbo = sphaero_ctx_draw_vbo;
+    return &ctx->pc;
+ }
+ 
+-
+ static struct pipe_resource* sphaero_drm_resource_create(struct pipe_screen *ps,
+                                           const struct pipe_resource *templat) {
+    struct sphaero_screen* screen = (struct sphaero_screen*)ps;
+    struct sphaero_resource* ret = CALLOC_STRUCT(sphaero_resource);
+-- 
+2.44.1
+

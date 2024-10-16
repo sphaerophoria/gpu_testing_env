@@ -6,12 +6,14 @@ const c = @cImport({
     @cInclude("uapi/drm/sphaero_drm.h");
     @cInclude("EGL/egl.h");
     @cInclude("EGL/eglext.h");
+    @cDefine("GL_GLEXT_PROTOTYPES", "");
     @cInclude("GL/gl.h");
     @cInclude("gbm.h");
 });
 const Allocator = std.mem.Allocator;
 const model_renderer = @import("model_renderer.zig");
 
+// FIXME: Width and height should be selected by preferred mode
 const width = 1024;
 const height = 768;
 
@@ -103,6 +105,48 @@ fn getFramebuffer(bo: *c.gbm_bo, f: std.fs.File) !u32 {
     return fb_id;
 }
 
+fn compileLinkProgram(vs: []const u8, fs: []const u8) !c.GLuint {
+    const vertex_shader = c.glCreateShader(c.GL_VERTEX_SHADER);
+    const vs_len_i: i32 = @intCast(vs.len);
+    c.glShaderSource(vertex_shader, 1, &vs.ptr, &vs_len_i);
+    c.glCompileShader(vertex_shader);
+
+    var success: c_int = 0;
+    c.glGetShaderiv(vertex_shader, c.GL_COMPILE_STATUS, &success);
+    if (success == 0) {
+        var buf: [1024]u8 = undefined;
+        var print_len: c.GLsizei = 0;
+        c.glGetShaderInfoLog(vertex_shader, @intCast(buf.len), &print_len, &buf);
+        std.log.err("Vertex shader compilation failed", .{});
+        std.log.err("{s}", .{buf[0..@intCast(print_len)]});
+        return error.VertexShaderCompile;
+    }
+
+    const fragment_shader = c.glCreateShader(c.GL_FRAGMENT_SHADER);
+    const fs_len_i: i32 = @intCast(fs.len);
+    c.glShaderSource(fragment_shader, 1, &fs.ptr, &fs_len_i);
+    c.glCompileShader(fragment_shader);
+    c.glGetShaderiv(fragment_shader, c.GL_COMPILE_STATUS, &success);
+    if (success == 0) {
+        return error.FragmentShaderCompile;
+    }
+
+    const program = c.glCreateProgram();
+    c.glAttachShader(program, vertex_shader);
+    c.glAttachShader(program, fragment_shader);
+    c.glLinkProgram(program);
+    c.glGetProgramiv(program, c.GL_LINK_STATUS, &success);
+    if (success != 1) {
+        var buf: [1024]u8 = undefined;
+        var print_len: c.GLsizei = 0;
+        c.glGetProgramInfoLog(program, @intCast(buf.len), &print_len, &buf);
+        std.log.err("Linking program failed", .{});
+        std.log.err("{s}", .{buf[0..@intCast(print_len)]});
+        return error.LinkProgram;
+    }
+    return program;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -163,7 +207,11 @@ pub fn main() !void {
 
     const config = chooseConfig(display, configs) orelse return error.NoGoodConfig;
 
-    const context = c.eglCreateContext(display, config, c.EGL_NO_CONTEXT, null);
+    const context_attribs = [_]c.EGLint{
+        c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
+        c.EGL_NONE,
+    };
+    const context = c.eglCreateContext(display, config, c.EGL_NO_CONTEXT, &context_attribs);
     if (context == c.EGL_NO_CONTEXT) {
         return error.CreateContext;
     }
@@ -195,6 +243,29 @@ pub fn main() !void {
         return error.SetCrtc;
     }
 
+    const program = try compileLinkProgram(@embedFile("vertex.glsl"), @embedFile("fragment.glsl"));
+    c.glUseProgram(program);
+
+    var vao: c.GLuint = 0;
+    c.glGenVertexArrays(1, &vao);
+    c.glBindVertexArray(vao);
+
+    var vbo: c.GLuint = 0;
+    c.glGenBuffers(1, &vbo);
+    c.glBindBuffer(c.GL_ARRAY_BUFFER, vbo);
+
+    const vertices = [_]f32{
+        -0.5, -0.5, 0.0,
+        0.5, -0.5, 0.0,
+        0.0, 0.5, 0.0,
+    };
+
+
+    c.glBufferData(c.GL_ARRAY_BUFFER, @intCast(@sizeOf(f32) * vertices.len), &vertices, c.GL_STATIC_DRAW);
+
+    c.glVertexAttribPointer(0, 3, c.GL_FLOAT, c.GL_FALSE, 3 * @sizeOf(f32), @ptrFromInt(0));
+    c.glEnableVertexAttribArray(0);
+
     std.debug.print("success\n", .{});
 
     var color: f32 = 0.0;
@@ -205,9 +276,10 @@ pub fn main() !void {
         while (color > 1.0) {
             color -= 1.0;
         }
-        c.glViewport(0, 0, 512, 512);
+        c.glViewport(0, 0, width, height);
         c.glClearColor(0.0, color, 0.0, 1.0);
         c.glClear(c.GL_COLOR_BUFFER_BIT);
+        c.glDrawArrays(c.GL_TRIANGLES, 0, 3);
         c.glFlush();
         const next_bo = try swapBuffers(display, egl_surface, gbm_surface);
         fb_id = try getFramebuffer(next_bo, f);
