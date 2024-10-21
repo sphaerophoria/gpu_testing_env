@@ -1,0 +1,336 @@
+From 8a961fc74ae7c7653c3da8423b413159e2301fd6 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 21 Oct 2024 13:19:15 -0700
+Subject: [PATCH] Move gpu work into libgpu
+
+Prep work for more complex behavior. Move all existing behavior into
+external zig library
+
+Bonus change:
+Remove old framebuffer API as it's been replaced with mmapping
+---
+ hw/misc/sphaero.c | 185 +++++++++-------------------------------------
+ meson.build       |  11 +++
+ 2 files changed, 47 insertions(+), 149 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index a17140da4..1aea5573c 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -1,7 +1,8 @@
+ #include "qemu/osdep.h"
+ #include "ui/console.h"
+ #include "hw/pci/pci_device.h"
++#include "libgpu/libgpu.h"
+ 
+ #define TYPE_SPHAERO "sphaero"
+ OBJECT_DECLARE_SIMPLE_TYPE(SphaeroState, SPHAERO)
+ 
+@@ -34,52 +35,11 @@ typedef enum SphaeroRegCommand {
+ #define SPHAERO_NUM_ARG_REGS 10
+ 
+ #define SPHAERO_TRANSFORM_SIZE (16 * sizeof(float))
+ 
+-typedef struct SphaeroPushBuf {
+-    void* data;
+-    size_t len;
+-    size_t capacity;
+-} SphaeroPushBuf;
+-
+-static SphaeroPushBuf sphaero_push_buf_create(size_t size) {
+-    SphaeroPushBuf ret = {
+-        .data = malloc(size),
+-        .len = 0,
+-        .capacity = size,
+-    };
+-    memset(ret.data, 0, size);
+-    return ret;
+-}
+-
+-static SphaeroPushBuf sphaero_pixel_buf_create(void) {
+-    return sphaero_push_buf_create(PIXELS_SIZE);
+-}
+ 
+ #define min(a, b) (a) < (b) ? (a) : (b)
+ 
+-static void sphaero_push_buf_push_data(SphaeroPushBuf* buf, void* data, size_t len) {
+-    size_t copy_len = min(len, buf->capacity - buf->len);
+-    memcpy(buf->data + buf->len, data, copy_len);
+-    buf->len += copy_len;
+-}
+-
+-static void sphaero_push_buf_push_data_cb(void* buf, void* data, size_t len) {
+-    sphaero_push_buf_push_data(buf, data, len);
+-}
+-
+-typedef struct SphaeroGlBufParams {
+-    GLuint vao;
+-    GLuint vbo;
+-} SphaeroGlBufParams;
+-
+-typedef struct SphaeroTexture {
+-    uint32_t stride;
+-    uint32_t width;
+-    uint32_t height;
+-    uint8_t* data;
+-} SphaeroTexture;
+-
+ typedef struct SphaeroState
+ {
+     PCIDevice parent_obj;
+ 
+@@ -90,62 +50,13 @@ typedef struct SphaeroState
+     QemuConsole* console;
+ 
+     uint32_t args[SPHAERO_NUM_ARG_REGS];
+ 
+-    uint64_t transform_address;
+-
+     void* pages[SPHAERO_NUM_BAR_PAGES];
+ 
+-    struct {
+-        QemuMutex lock;
+-        GHashTable *textures;
+-        GHashTable *dumb;
+-    } texture_protected;
+-
+-    SphaeroPushBuf pixels[2];
+-    bool display_idx;
++    struct libgpu_gpu* gpu;
+ } SphaeroState;
+ 
+-typedef void (*sphaero_dma_copy_fn)(void* context, void* data, size_t len);
+-
+-static void sphaero_do_dma(uint64_t in_addr, uint64_t in_len, sphaero_dma_copy_fn copy_fn, void* copy_context) {
+-
+-    uint64_t addr = in_addr;
+-    while (addr < in_addr + in_len) {
+-        uint64_t written = addr - in_addr;
+-        uint64_t len = in_len - written;
+-        uint32_t* map = dma_memory_map(&address_space_memory, addr, &len,
+-                             DMA_DIRECTION_TO_DEVICE,
+-                             MEMTXATTRS_UNSPECIFIED);
+-        addr += len;
+-
+-        if (len == 0) {
+-            printf("Mapped 0 bytes sadge\n");
+-            break;
+-        }
+-
+-        copy_fn(copy_context, map, len);
+-
+-        dma_memory_unmap(&address_space_memory, map, len, DMA_DIRECTION_TO_DEVICE, len);
+-    }
+-}
+-
+-static SphaeroPushBuf* sphaero_current_pixel_buf(SphaeroState* s) {
+-    return &s->pixels[s->display_idx];
+-}
+-
+-static void sphaero_swap_pixel_buf(SphaeroState* s) {
+-    s->display_idx = !s->display_idx;
+-    sphaero_current_pixel_buf(s)->len = 0;
+-}
+-
+-static void sphaero_commit_frame(SphaeroState* s) {
+-    DisplaySurface* ds = qemu_create_displaysurface_from(SPHAERO_OUTPUT_WIDTH, SPHAERO_OUTPUT_HEIGHT, PIXMAN_a8r8g8b8, SPHAERO_OUTPUT_WIDTH * 4, sphaero_current_pixel_buf(s)->data);
+-    dpy_gfx_replace_surface(s->console, ds);
+-    dpy_gfx_update_full(s->console);
+-
+-    sphaero_swap_pixel_buf(s);
+-}
+ 
+ static bool sphaero_is_little_endian(void) {
+     int n = 1;
+     // little endian if true
+@@ -154,16 +65,11 @@ static bool sphaero_is_little_endian(void) {
+ 
+ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+     switch (cmd) {
+         case SPHAERO_REG_CMD_PUSH_FB_CHUNK: {
+-            assert(sphaero_is_little_endian());
+-            uint64_t *dma_address = (uint64_t*)s->args;
+-            uint64_t *dma_len = (uint64_t*)(s->args + 2);
+-            sphaero_do_dma(*dma_address, *dma_len, sphaero_push_buf_push_data_cb, &s->pixels[s->display_idx]);
+             break;
+         }
+         case SPHAERO_REG_CMD_COMMIT_FB: {
+-            sphaero_commit_frame(s);
+             break;
+         }
+         case SPHAERO_REG_CMD_SET_VB_SIZE: {
+             break;
+@@ -183,19 +89,10 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+             assert(sphaero_is_little_endian());
+             uint64_t *hw_id = (uint64_t*)s->args;
+             uint32_t width = *(s->args + 2);
+             uint32_t height = *(s->args + 3);
+-            uint64_t size = width * height * 4;
+-
+-            SphaeroTexture* texture = malloc(sizeof(*texture));
+-            texture->data = malloc(size);
+-            texture->stride = width * 4;
+-            texture->width = width;
+-            texture->height = height;
+ 
+-            qemu_mutex_lock(&s->texture_protected.lock);
+-            g_hash_table_insert(s->texture_protected.textures, GINT_TO_POINTER(*hw_id), texture);
+-            qemu_mutex_unlock(&s->texture_protected.lock);
++            libgpu_gpu_create_texture(s->gpu, *hw_id, width, height);
+             break;
+         }
+         case SPHAERO_REG_CMD_GL_CLEAR: {
+             assert(sphaero_is_little_endian());
+@@ -205,75 +102,71 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+             uint32_t maxx = *(s->args + 7);
+             uint32_t miny = *(s->args + 8);
+             uint32_t maxy = *(s->args + 9);
+ 
+-            qemu_mutex_lock(&s->texture_protected.lock);
+-            SphaeroTexture* texture = g_hash_table_lookup(s->texture_protected.textures, GINT_TO_POINTER(*handle));
+-            if (maxx == 0) {
+-                maxx = texture->width;
+-            }
+-            if (maxy == 0) {
+-                maxy = texture->height;
+-            }
+-            for (uint32_t y = miny; y < maxy; ++y) {
+-                for (uint32_t x = minx; x < maxx; ++x) {
+-                    for (int c = 0; c < 4; ++c) {
+-                        texture->data[y * texture->stride + x * 4 + c] = color_buf[c] * 255.0;
+-                    }
+-                }
+-            }
+-
+-            qemu_mutex_unlock(&s->texture_protected.lock);
++            libgpu_gpu_clear(s->gpu, *handle, color_buf, minx, maxx, miny, maxy);
+             break;
+        }
+         case SPHAERO_REG_CMD_SET_HW_FB: {
+             assert(sphaero_is_little_endian());
+ 
+-            qemu_mutex_lock(&s->texture_protected.lock);
+-
+             uint64_t* handle = (uint64_t*)s->args;
+-            SphaeroTexture* texture = g_hash_table_lookup(s->texture_protected.textures, GINT_TO_POINTER(*handle));
+-            DisplaySurface* ds = qemu_create_displaysurface_from(texture->width, texture->height, PIXMAN_a8r8g8b8, texture->stride, texture->data);
++
++            void* data;
++            uint32_t width, height, stride;
++            if (!libgpu_gpu_get_tex_data(s->gpu, *handle, &width, &height, &stride, &data)) {
++                break;
++            }
++            DisplaySurface* ds = qemu_create_displaysurface_from(width, height, PIXMAN_a8r8g8b8, stride, data);
+             dpy_gfx_replace_surface(s->console, ds);
+             dpy_gfx_update_full(s->console);
+ 
+-            qemu_mutex_unlock(&s->texture_protected.lock);
+             break;
+         }
+         case SPHAERO_REG_CMD_ALLOC_HW_BUF: {
++            assert(sphaero_is_little_endian());
+             uint64_t* hw_id = (uint64_t*)s->args;
+             uint64_t* size = (uint64_t*)(s->args + 2);
+ 
+-            uint8_t* buf = malloc(*size);
+-
+-            qemu_mutex_lock(&s->texture_protected.lock);
+-            g_hash_table_insert(s->texture_protected.dumb, GINT_TO_POINTER(*hw_id), buf);
+-            qemu_mutex_unlock(&s->texture_protected.lock);
++            libgpu_gpu_create_dumb(s->gpu, *hw_id, *size);
++            void* buf;
++            libgpu_gpu_get_dumb(s->gpu, *hw_id, &buf);
+             break;
+         }
+         case SPHAERO_REG_CMD_MAP_HW_BUF: {
+             uint64_t hw_id = *(uint64_t*)s->args;
+             uint32_t page_offs = *(s->args + 2);
+             uint32_t dest_page = *(s->args + 3);
+ 
+-            qemu_mutex_lock(&s->texture_protected.lock);
+-            void* buf = g_hash_table_lookup(s->texture_protected.dumb, GINT_TO_POINTER(hw_id));
++            void* buf;
++            if (!libgpu_gpu_get_dumb(s->gpu, hw_id, &buf)) {
++                printf("Failed to map %d\n", dest_page);
++                break;
++            }
+             s->pages[dest_page] = (buf + page_offs * SPHAERO_PAGE_SIZE);
+-            qemu_mutex_unlock(&s->texture_protected.lock);
+             break;
+         }
+         case SPHAERO_REG_CMD_SET_DUMB_FB: {
+             assert(sphaero_is_little_endian());
+ 
+-            qemu_mutex_lock(&s->texture_protected.lock);
+-
+             uint64_t* handle = (uint64_t*)s->args;
+-            void* buf = g_hash_table_lookup(s->texture_protected.dumb, GINT_TO_POINTER(*handle));
+-            DisplaySurface* ds = qemu_create_displaysurface_from(1024, 768, PIXMAN_a8r8g8b8, 1024 * 4, buf);
++            uint32_t width = *(s->args + 2);
++            uint32_t height = *(s->args + 3);
++
++            void* buf;
++            // FIXME: Thread safety here seems a little sketchy. If libgpu is
++            // "thread safe" this call would mutex lock internally, however it
++            // returns a reference to data. We probably need to have some
++            // reference counting externally so that libgpu knows when it is
++            // allowed to free a buffer or not or something. Maybe it's fine
++            // because right now we don't ever actually release IDs :)
++            if (!libgpu_gpu_get_dumb(s->gpu, *handle, &buf)) {
++                break;
++            }
++
++            DisplaySurface* ds = qemu_create_displaysurface_from(width, height, PIXMAN_a8r8g8b8, width * 4, buf);
+             dpy_gfx_replace_surface(s->console, ds);
+             dpy_gfx_update_full(s->console);
+-
+-            qemu_mutex_unlock(&s->texture_protected.lock);
+             break;
+         }
+         case SPHAERO_REG_CMD_MAX:
+             assert(false);
+@@ -371,16 +264,10 @@ static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
+     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
+     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mapped_gpu_mem_bar);
+ 
+     s->as = pci_get_address_space(dev);
+-    s->display_idx = false;
+-    s->pixels[0] = sphaero_pixel_buf_create();
+-    s->pixels[1] = sphaero_pixel_buf_create();
+     s->console = graphic_console_init(DEVICE(dev), 0, &sphaero_gpu_ops, s);
+-
+-    qemu_mutex_init(&s->texture_protected.lock);
+-    s->texture_protected.textures = g_hash_table_new(NULL, NULL);
+-    s->texture_protected.dumb = g_hash_table_new(NULL, NULL);
++    s->gpu = libgpu_gpu_create();
+ }
+ 
+ static void sphaero_class_init(ObjectClass *klass, void *data)
+ {
+diff --git a/meson.build b/meson.build
+index fbda17c98..1b734d841 100644
+--- a/meson.build
++++ b/meson.build
+@@ -3840,8 +3840,19 @@ libhwcore = static_library('hwcore', sources: hwcore_ss.sources() + genh,
+                            build_by_default: false)
+ hwcore = declare_dependency(objects: libhwcore.extract_all_objects(recursive: false))
+ common_ss.add(hwcore)
+ 
++project_root = meson.global_source_root()
++libgpu_root = project_root.replace('src/qemu-9.1.0', 'libgpu/zig-out')
++cxx = meson.get_compiler('c')
++libgpu = cxx.find_library('gpu',
++  dirs: [libgpu_root + '/lib'],
++  static: true,
++)
++system_ss.add(libgpu)
++libgpu_include_dir = libgpu_root + '/include'
++common_user_inc += libgpu_include_dir
++
+ ###########
+ # Targets #
+ ###########
+ 
+-- 
+2.44.1
+
