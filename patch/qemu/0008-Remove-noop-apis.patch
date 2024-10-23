@@ -1,0 +1,61 @@
+From 35cbba7e86ec5b698934e42f6a2d691029706158 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 28 Oct 2024 20:04:32 +0000
+Subject: [PATCH] Remove noop apis
+
+---
+ hw/misc/sphaero.c | 27 ---------------------------
+ 1 file changed, 27 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index 1aea5573c..beaf290b8 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -15,15 +15,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SphaeroState, SPHAERO)
+ #define SPHAERO_PAGE_SIZE 4096
+ #define SPHAERO_NUM_BAR_PAGES (SPHAERO_PAGE_BAR_SIZE / SPHAERO_PAGE_SIZE)
+ 
+ typedef enum SphaeroRegCommand {
+-    SPHAERO_REG_CMD_PUSH_FB_CHUNK,
+-    SPHAERO_REG_CMD_COMMIT_FB,
+-    SPHAERO_REG_CMD_SET_VB_SIZE,
+-    SPHAERO_REG_CMD_PUSH_VB_CHUNK,
+-    SPHAERO_REG_CMD_SET_TEXTURE_SIZE,
+-    SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK,
+-    SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM,
+     SPHAERO_REG_CMD_CREATE_GL_TEX,
+     SPHAERO_REG_CMD_GL_CLEAR,
+     SPHAERO_REG_CMD_SET_HW_FB,
+     SPHAERO_REG_CMD_ALLOC_HW_BUF,
+@@ -64,28 +57,8 @@ static bool sphaero_is_little_endian(void) {
+ }
+ 
+ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+     switch (cmd) {
+-        case SPHAERO_REG_CMD_PUSH_FB_CHUNK: {
+-            break;
+-        }
+-        case SPHAERO_REG_CMD_COMMIT_FB: {
+-            break;
+-        }
+-        case SPHAERO_REG_CMD_SET_VB_SIZE: {
+-            break;
+-        }
+-        case SPHAERO_REG_CMD_PUSH_VB_CHUNK: {
+-            break;
+-        }
+-        case SPHAERO_REG_CMD_SET_TEXTURE_SIZE: {
+-            break;
+-        }
+-        case SPHAERO_REG_CMD_PUSH_TEXTURE_CHUNK: {
+-            break;
+-        }
+-        case SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM:
+-            break;
+         case SPHAERO_REG_CMD_CREATE_GL_TEX: {
+             assert(sphaero_is_little_endian());
+             uint64_t *hw_id = (uint64_t*)s->args;
+             uint32_t width = *(s->args + 2);
+-- 
+2.44.1
+

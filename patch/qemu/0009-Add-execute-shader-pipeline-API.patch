@@ -1,0 +1,68 @@
+From ef507423b4be02b7b32b87f91a35b1d21f541edb Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Tue, 29 Oct 2024 21:51:01 +0000
+Subject: [PATCH] Add execute shader pipeline API
+
+* Dispatch to libgpu for actual work
+* GPU shader execution required more than the existing 10 args, add
+  calculated num args macro that is tied to PCI bar size
+---
+ hw/misc/sphaero.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index beaf290b8..cf3f04a79 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -21,12 +21,14 @@ typedef enum SphaeroRegCommand {
+     SPHAERO_REG_CMD_SET_HW_FB,
+     SPHAERO_REG_CMD_ALLOC_HW_BUF,
+     SPHAERO_REG_CMD_MAP_HW_BUF,
+     SPHAERO_REG_CMD_SET_DUMB_FB,
++    SPHAERO_REG_CMD_EXEC_SHADER_PIPELINE,
+     SPHAERO_REG_CMD_MAX,
+ } SphaeroRegCommand;
+ 
+-#define SPHAERO_NUM_ARG_REGS 10
++#define SPHAERO_CMD_BAR_SIZE (128)
++#define SPHAERO_NUM_ARG_REGS (SPHAERO_CMD_BAR_SIZE / 4)
+ 
+ #define SPHAERO_TRANSFORM_SIZE (16 * sizeof(float))
+ 
+ 
+@@ -140,8 +142,21 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+             dpy_gfx_replace_surface(s->console, ds);
+             dpy_gfx_update_full(s->console);
+             break;
+         }
++        case SPHAERO_REG_CMD_EXEC_SHADER_PIPELINE: {
++            assert(sphaero_is_little_endian());
++
++            uint64_t vs_handle = *(uint64_t*)s->args;
++            uint64_t fs_handle = *(uint64_t*)(s->args + 2);
++            uint64_t vb_handle = *(uint64_t*)(s->args + 4);
++            uint64_t vb_format_handle = *(uint64_t*)(s->args + 6);
++            uint64_t tex_handle = *(uint64_t*)(s->args + 8);
++            uint32_t num_elems = *(s->args + 10);
++
++            libgpu_execute_graphics_pipeline(s->gpu, vs_handle, fs_handle, vb_handle, vb_format_handle, tex_handle, num_elems);
++            break;
++        }
+         case SPHAERO_REG_CMD_MAX:
+             assert(false);
+             return;
+     }
+@@ -228,9 +243,9 @@ static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
+ {
+     SphaeroState *s = SPHAERO(dev);
+ 
+     memory_region_init_io(&s->bar, OBJECT(s), &sphaero_ops, s,
+-                          "sphaero", 128);
++                          "sphaero", SPHAERO_CMD_BAR_SIZE);
+ 
+     memory_region_init_io(&s->mapped_gpu_mem_bar, OBJECT(s), &sphaero_mapped_gpu_mem_ops, s,
+                           "sphaero_gpu_mem", 256 * 1024 * 1024);
+ 
+-- 
+2.44.1
+

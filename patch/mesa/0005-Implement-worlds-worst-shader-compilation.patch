@@ -1,0 +1,526 @@
+From 3c11ea08bdb47c653c83f95a0a7d229b6b070e8f Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Tue, 22 Oct 2024 11:15:44 -0700
+Subject: [PATCH] Implement worlds worst shader compilation
+
+Given the worlds simplest vertex shader
+`gl_Position = vec4(in_vec3, 1.0);`
+
+and the worlds simplest fragment shader
+`gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);`
+
+Implement enough of a driver to render a single triangle correctly.
+
+Shader compilation is done through libgpu_shader, and compiled data is
+uploaded to the GPU via mmaped GPU buffers. libgpu_shader compilation
+maps very closely to the NIR that we get from mesa. Many many many
+assumptions are made about our input. The vast majority of shaders will
+crash, or not work correctly
+---
+ src/gallium/winsys/sphaero/drm/meson.build    |  13 +-
+ .../winsys/sphaero/drm/sphaero_drm_winsys.c   | 357 +++++++++++++++---
+ 2 files changed, 326 insertions(+), 44 deletions(-)
+
+diff --git a/src/gallium/winsys/sphaero/drm/meson.build b/src/gallium/winsys/sphaero/drm/meson.build
+index 3d9f717..4f82ca9 100644
+--- a/src/gallium/winsys/sphaero/drm/meson.build
++++ b/src/gallium/winsys/sphaero/drm/meson.build
+@@ -17,11 +17,20 @@
+ # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ # SOFTWARE.
+ 
++
++project_root = meson.global_source_root()
++libgpu_root = project_root.replace('src/mesa-24.0.9', 'libgpu/zig-out')
++cxx = meson.get_compiler('cpp')
++libgpu = cxx.find_library('gpushader',
++  dirs: [libgpu_root + '/lib'],
++  static: true,
++)
++
+ libsphaerodrm = static_library(
+   'sphaerodrm',
+   'sphaero_drm_winsys.c',
+-  include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium, inc_gallium_aux, inc_gallium_drivers],
+-  dependencies : [dep_libdrm, dep_libvirglcommon, idep_mesautil, idep_nir_headers],
++  include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium, inc_gallium_aux, inc_gallium_drivers, libgpu_root + '/include'],
++  dependencies : [dep_libdrm, dep_libvirglcommon, idep_mesautil, idep_nir_headers, libgpu],
+   gnu_symbol_visibility : 'hidden',
+ )
+diff --git a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+index 7b1c8d1..71d0304 100644
+--- a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
++++ b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+@@ -6,11 +6,39 @@
+ #include "util/u_memory.h"
+ #include "util/u_screen.h"
+ #include "util/u_inlines.h"
+ #include "drm-uapi/sphaero_drm.h"
++#include "libgpu/libgpu_shader.h"
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_deref.h"
+ #include <xf86drm.h>
+ #include "util/format/u_format.h"
++#include <sys/mman.h>
+ 
++
++struct sphaero_resource {
++   struct pipe_resource pr;
++   uint32_t handle;
++};
++
++struct sphaero_shader_state {
++   uint32_t handle;
++};
++
++struct sphaero_context {
++   struct pipe_context pc;
++   struct sphaero_resource* bound_texture;
++   struct pipe_vertex_element* vertex_elements;
++   unsigned num_vertex_elements;
++   struct pipe_vertex_buffer vertex_buffer;
++   struct sphaero_shader_state vs;
++   struct sphaero_shader_state fs;
++};
++
++struct sphaero_screen {
++   struct pipe_screen ps;
++   int fd;
++};
+ static int sphaero_get_screen_fd(struct pipe_screen *screen) {
+    return -1;
+ }
+ 
+@@ -24,8 +52,9 @@ static int sphaero_drm_get_param(struct pipe_screen *screen, enum pipe_cap param
+       case PIPE_CAP_UMA: return 0; break;
+       default: return u_pipe_screen_get_param_defaults(screen, param); break;
+    }
+ }
++
+ static float
+ sphaero_drm_get_paramf(struct pipe_screen *screen, enum pipe_capf param)
+ {
+    return 0.0f;
+@@ -60,12 +89,188 @@ sphaero_drm_get_shader_param(struct pipe_screen *screen,
+    }
+    return 0;
+ }
+ 
+-static void *sphaero_ctx_create_shader_state(struct pipe_context *ctx,
+-                                      const struct pipe_shader_state *state)
++static int sphaero_alloc_gpu_obj(int fd, size_t size, uint32_t* handle) {
++      struct drm_sphaero_alloc_gpu_obj create_req = {
++         .size = size,
++      };
++
++      if (drmIoctl(fd, DRM_IOCTL_SPHAERO_ALLOC_GPU_OBJ, &create_req)) {
++         fprintf(stderr, "alloc gpu obj failed\n");
++         return errno;
++      }
++
++      *handle = create_req.handle;
++      return 0;
++}
++
++static int sphaero_copy_to_gpu(int fd, uint32_t gpu_handle, const void* data, size_t size) {
++   struct drm_sphaero_map_gpu_obj map_req = {
++      .handle = gpu_handle,
++   };
++
++   if (drmIoctl(fd, DRM_IOCTL_SPHAERO_MAP_GPU_OBJ, &map_req)) {
++      fprintf(stderr, "map failed\n");
++      return errno;
++   }
++
++   void* out = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, map_req.offset);
++   memcpy(out, data, size);
++   munmap(out, size);
++
++   return 0;
++}
++
++static void *sphaero_compile_shader(int fd, struct libgpu_shader* libgpu_shader, struct nir_shader* shader) {
++   assert(exec_list_length(&shader->functions) == 1);
++
++   nir_function* func = exec_node_data_forward(nir_function, shader->functions.head_sentinel.next, node);
++   assert(func != NULL);
++
++   foreach_list_typed(nir_cf_node, node, node, &func->impl->body) {
++      assert(node->type == nir_cf_node_block);
++      struct nir_block *block = nir_cf_node_as_block(node);
++
++      nir_foreach_instr(instr, block) {
++         switch (instr->type) {
++            case nir_instr_type_alu: {
++               nir_alu_instr *alu = nir_instr_as_alu(instr);
++               switch (alu->op) {
++                  case nir_op_vec4:
++                     libgpu_shader_push_command_mov4(
++                           libgpu_shader,
++                           alu->def.index,
++                           alu->src[0].src.ssa->index, alu->src[0].swizzle[0],
++                           alu->src[1].src.ssa->index, alu->src[1].swizzle[0],
++                           alu->src[2].src.ssa->index, alu->src[2].swizzle[0],
++                           alu->src[3].src.ssa->index, alu->src[3].swizzle[0]
++                        );
++                     break;
++                  default:
++                     fprintf(stderr, "unhandled alu op %s\n", nir_op_infos[alu->op].name);
++                     break;
++               }
++               break;
++            }
++            case nir_instr_type_deref: {
++               nir_deref_instr *deref = nir_instr_as_deref(instr);
++               assert(deref->deref_type == nir_deref_type_var);
++
++               if (deref->var->data.mode & nir_var_shader_in) {
++                  libgpu_shader_push_command_load_input_reference(libgpu_shader, deref->def.index, deref->var->index);
++               }
++               else if (deref->var->data.mode & nir_var_shader_out) {
++                  libgpu_shader_push_command_load_output_reference(libgpu_shader, deref->def.index, deref->var->index);
++               }
++               break;
++            }
++            case nir_instr_type_intrinsic: {
++               nir_intrinsic_instr *intrinsic = nir_instr_as_intrinsic(instr);
++               assert(intrinsic->intrinsic == nir_intrinsic_load_deref || intrinsic->intrinsic == nir_intrinsic_store_deref);
++               if (intrinsic->intrinsic == nir_intrinsic_load_deref) {
++                  libgpu_shader_push_command_load(libgpu_shader, intrinsic->src[0].ssa->index, intrinsic->def.index);
++               }
++               else if (intrinsic->intrinsic == nir_intrinsic_store_deref) {
++                  libgpu_shader_push_command_store(libgpu_shader, intrinsic->src[1].ssa->index, intrinsic->src[0].ssa->index);
++               }
++               break;
++            }
++            case nir_instr_type_load_const: {
++               nir_load_const_instr *load_const = nir_instr_as_load_const(instr);
++
++               assert(load_const->def.bit_size == 32);
++               switch (load_const->def.num_components) {
++                  case 1:
++                     libgpu_shader_push_command_load_constant_f32(libgpu_shader, load_const->def.index, load_const->value[0].f32);
++                     break;
++                  case 4:
++                     libgpu_shader_push_command_load_constant_vec4(
++                           libgpu_shader,
++                           load_const->def.index,
++                           load_const->value[0].f32,
++                           load_const->value[1].f32,
++                           load_const->value[2].f32,
++                           load_const->value[3].f32
++                     );
++                     break;
++                  default:
++                     assert(!"Unhandled num components for load const");
++               }
++               break;
++            }
++            default:
++               assert(false && "Unhandled type");
++         }
++      }
++   }
++
++   void* data;
++   size_t data_len;
++   libgpu_compile_shader(libgpu_shader, &data, &data_len);
++
++   struct sphaero_shader_state *ret = MALLOC(sizeof(struct sphaero_shader_state));
++   if (sphaero_alloc_gpu_obj(fd, data_len, &ret->handle)) {
++      fprintf(stderr, "alloc gpu obj failed\n");
++      return NULL;
++   }
++
++   if (sphaero_copy_to_gpu(fd, ret->handle, data, data_len)) {
++      drmCloseBufferHandle(fd, ret->handle);
++
++      fprintf(stderr, "Failed to copy shader to gpu");
++      return NULL;
++   }
++
++   return ret;
++}
++
++static void *sphaero_ctx_create_vs_state(struct pipe_context *ctx,
++                                      const struct pipe_shader_state *templ)
+ {
+-   return MALLOC(1);
++   struct sphaero_screen* screen = (struct sphaero_screen*)ctx->screen;
++
++   struct libgpu_shader *libgpu_shader = libgpu_create_shader();
++   assert(templ->type == PIPE_SHADER_IR_NIR);
++   struct nir_shader* shader = templ->ir.nir;
++
++   nir_foreach_variable_with_modes(var, shader, nir_var_shader_in) {
++      assert(var->type->base_type == GLSL_TYPE_FLOAT);
++      assert(var->type->vector_elements == 3);
++      assert(libgpu_shader_push_input_vec3(libgpu_shader));
++   }
++
++   nir_foreach_variable_with_modes(var, shader, nir_var_shader_out) {
++      assert(var->type->base_type == GLSL_TYPE_FLOAT);
++      assert(var->type->vector_elements == 4);
++      assert(strcmp(var->name, "gl_Position") == 0);
++      assert(libgpu_shader_push_output_vec4(libgpu_shader));
++   }
++
++   return sphaero_compile_shader(screen->fd, libgpu_shader, shader);
++}
++
++static void *sphaero_ctx_create_fs_state(struct pipe_context *ctx,
++                                      const struct pipe_shader_state *templ)
++{
++   struct sphaero_screen* screen = (struct sphaero_screen*)ctx->screen;
++
++   struct libgpu_shader *libgpu_shader = libgpu_create_shader();
++   assert(templ->type == PIPE_SHADER_IR_NIR);
++   struct nir_shader* shader = templ->ir.nir;
++
++   nir_foreach_variable_with_modes(var, shader, nir_var_shader_in) {
++      assert(!"Fragment shader inputs unhandled");
++   }
++
++   nir_foreach_variable_with_modes(var, shader, nir_var_shader_out) {
++      assert(var->type->base_type == GLSL_TYPE_FLOAT);
++      assert(var->type->vector_elements == 4);
++      assert(libgpu_shader_push_output_vec4(libgpu_shader));
++   }
++
++   struct sphaero_shader_state* state = sphaero_compile_shader(screen->fd, libgpu_shader, shader);
++   return state;
+ }
+ 
+ static bool sphaero_drm_is_format_supported(struct pipe_screen *screen,
+                             enum pipe_format format,
+@@ -86,23 +291,8 @@ static bool sphaero_drm_is_format_supported(struct pipe_screen *screen,
+ static void sphaero_drm_destroy(struct pipe_screen * screen) {
+    FREE(screen);
+ }
+ 
+-struct sphaero_resource {
+-   struct pipe_resource pr;
+-   uint32_t handle;
+-};
+-
+-struct sphaero_context {
+-   struct pipe_context pc;
+-   struct sphaero_resource* bound_texture;
+-};
+-
+-struct sphaero_screen {
+-   struct pipe_screen ps;
+-   int fd;
+-};
+-
+ static void sphaero_ctx_set_framebuffer_state(struct pipe_context *pc,
+                               const struct pipe_framebuffer_state *state) {
+    struct sphaero_context* ctx = (struct sphaero_context*)pc;
+    ctx->bound_texture = (struct sphaero_resource*)state->cbufs[0]->texture;
+@@ -181,16 +371,11 @@ static void sphaero_ctx_buffer_subdata(struct pipe_context * pc,
+                        unsigned usage, /* a combination of PIPE_MAP_x */
+                        unsigned offset,
+                        unsigned size,
+                        const void *data) {
+-   // vertex data upload probably
+-   printf("Uploading vertex data of size %u\n", size);
+-   printf("Data if interprted as floats...\n");
+-   const float* data_f = data;
+-   for (int i = 0; i < size / 4; ++i) {
+-      printf("%f ", data_f[i]);
+-   }
+-   printf("\n");
++   struct sphaero_screen* screen = (struct sphaero_screen*)pc->screen;
++   struct sphaero_resource *res = (struct sphaero_resource*)pr;
++   sphaero_copy_to_gpu(screen->fd, res->handle, data, size);
+ }
+ 
+ static void* sphaero_ctx_create_depth_stencil_alpha_state(struct pipe_context * pc,
+                                      const struct pipe_depth_stencil_alpha_state * as) {
+@@ -199,11 +384,19 @@ static void* sphaero_ctx_create_depth_stencil_alpha_state(struct pipe_context *
+ 
+ static void sphaero_ctx_bind_depth_stencil_alpha_state(struct pipe_context * pc, void * state) {
+ }
+ 
+-static void   sphaero_ctx_bind_fs_state(struct pipe_context * pc , void * state) {}
++static void   sphaero_ctx_bind_fs_state(struct pipe_context * pc , void * state_opaque) {
++   struct sphaero_context *ctx = (struct sphaero_context*)pc;
++   struct sphaero_shader_state *state = state_opaque;
++   ctx->fs = *state;
++}
+ 
+-static void   sphaero_ctx_bind_vs_state(struct pipe_context * pc, void * state ) {}
++static void   sphaero_ctx_bind_vs_state(struct pipe_context * pc, void * state_opaque ) {
++   struct sphaero_context *ctx = (struct sphaero_context*)pc;
++   struct sphaero_shader_state *state = state_opaque;
++   ctx->vs = *state;
++}
+ static void sphaero_ctx_set_polygon_stipple(struct pipe_context * pc,
+                             const struct pipe_poly_stipple * stipple) {
+    // ????
+ }
+@@ -230,30 +423,101 @@ static void sphaero_ctx_set_viewport_states(struct pipe_context *pc,
+                             const struct pipe_viewport_state * states) {
+ 
+ }
+ 
++struct sphaero_vertex_elements {
++   unsigned num_elements;
++   struct pipe_vertex_element* elements;
++};
++
+ static void * sphaero_ctx_create_vertex_elements_state(struct pipe_context * pc,
+                                        unsigned num_elements,
+                                        const struct pipe_vertex_element * input) {
+-   return MALLOC(1);
++   struct sphaero_vertex_elements* elems = MALLOC(sizeof(struct sphaero_vertex_elements));
++   elems->num_elements = num_elements;
++   elems->elements = calloc(num_elements, sizeof(struct pipe_vertex_element));
++   memcpy(elems->elements, input, sizeof(*input) * num_elements);
++   return elems;
+ }
+ 
+-static void sphaero_ctx_bind_vertex_elements_state(struct pipe_context * pc, void * state) {}
++static void sphaero_ctx_bind_vertex_elements_state(struct pipe_context * pc, void * state) {
++   struct sphaero_vertex_elements* elems = state;
++   struct sphaero_context* ctx = (struct sphaero_context*)pc;
++   ctx->num_vertex_elements = elems->num_elements;
++   ctx->vertex_elements = elems->elements;
++}
+ 
+ static void sphaero_ctx_set_vertex_buffers(struct pipe_context *pc,
+                            unsigned num_buffers,
+                            unsigned unbind_num_trailing_slots,
+                            bool take_ownership,
+                            const struct pipe_vertex_buffer * vertex_buffers) {
++   struct sphaero_context *ctx = (struct sphaero_context*)pc;
+ 
++   assert(num_buffers == 1);
++   if (!take_ownership && !vertex_buffers[0].is_user_buffer) {
++      pipe_resource_reference(&ctx->vertex_buffer.buffer.resource, vertex_buffers[0].buffer.resource);
++   }
++   ctx->vertex_buffer = vertex_buffers[0];
++}
++
++static int sphaero_make_gpu_elems(struct sphaero_context *ctx, struct sphaero_screen *screen, uint32_t* handle) {
++
++   struct libgpu_shader_input_defs* input_defs = libgpu_shader_create_input_defs();
++   libgpu_shader_input_defs_push_vec3(input_defs, ctx->vertex_elements[0].src_offset, ctx->vertex_elements[0].src_stride);
++   void* input_defs_data;
++   size_t input_defs_len;
++   libgpu_shader_input_compile(input_defs, &input_defs_data, &input_defs_len);
++   libgpu_shader_free_input_defs(input_defs);
++
++   if (sphaero_alloc_gpu_obj(screen->fd, input_defs_len, handle)) {
++      fprintf(stderr, "Failed to allocate input defs obj\n");
++      return 1;
++   }
++
++   if (sphaero_copy_to_gpu(screen->fd, *handle, input_defs_data, input_defs_len)) {
++      fprintf(stderr, "Failed to copy input defs obj\n");
++      drmCloseBufferHandle(screen->fd, *handle);
++   }
++
++   return 0;
+ }
+ 
+ static void sphaero_ctx_draw_vbo(struct pipe_context *pipe,
+                                const struct pipe_draw_info *info,
+                                unsigned drawid_offset,
+                                const struct pipe_draw_indirect_info *indirect,
+                                const struct pipe_draw_start_count_bias *draws,
+                                unsigned num_draws) {
++   struct sphaero_context *ctx = (struct sphaero_context*)pipe;
++   struct sphaero_screen *screen = (struct sphaero_screen*)pipe->screen;
++
++   assert(info->has_user_indices == false);
++   assert(ctx->num_vertex_elements == 1);
++   assert(ctx->vertex_elements[0].src_format == PIPE_FORMAT_R32G32B32_FLOAT);
++
++   struct sphaero_resource *res =  (struct sphaero_resource*)ctx->vertex_buffer.buffer.resource;
++
++   uint32_t input_defs_handle = 0;
++   sphaero_make_gpu_elems(ctx, screen, &input_defs_handle);
++
++   assert(num_draws == 1);
++   assert(info->mode == MESA_PRIM_TRIANGLES);
++
++   struct drm_sphaero_exec_shader_pipeline exec_req = {
++	.vs_handle = ctx->vs.handle,
++	.fs_handle = ctx->fs.handle,
++	.vb_handle = res->handle,
++	.format_handle = input_defs_handle,
++	.texture_handle = ctx->bound_texture->handle,
++	.num_inputs = draws[0].count
++   };
++
++   if (drmIoctl(screen->fd, DRM_IOCTL_SPHAERO_EXEC_SHADER_PIPELINE, &exec_req)) {
++      fprintf(stderr, "Failed to execute draw\n");
++   }
++
++   drmCloseBufferHandle(screen->fd, input_defs_handle);
+ }
+ 
+ static struct pipe_context* sphaero_context_create(struct pipe_screen *screen,
+                                         void *priv, unsigned flags) {
+@@ -264,10 +528,10 @@ static struct pipe_context* sphaero_context_create(struct pipe_screen *screen,
+    ctx->pc.set_framebuffer_state = sphaero_ctx_set_framebuffer_state;
+    ctx->pc.clear = sphaero_ctx_clear;
+    ctx->pc.flush = sphaero_ctx_flush;
+    ctx->pc.flush_resource = sphaero_ctx_flush_resource;
+-   ctx->pc.create_vs_state = sphaero_ctx_create_shader_state;
+-   ctx->pc.create_fs_state = sphaero_ctx_create_shader_state;
++   ctx->pc.create_vs_state = sphaero_ctx_create_vs_state;
++   ctx->pc.create_fs_state = sphaero_ctx_create_fs_state;
+    ctx->pc.buffer_subdata = sphaero_ctx_buffer_subdata;
+    ctx->pc.create_depth_stencil_alpha_state = sphaero_ctx_create_depth_stencil_alpha_state;
+    ctx->pc.bind_depth_stencil_alpha_state = sphaero_ctx_bind_depth_stencil_alpha_state;
+    ctx->pc.bind_fs_state = sphaero_ctx_bind_fs_state;
+@@ -287,24 +551,33 @@ static struct pipe_context* sphaero_context_create(struct pipe_screen *screen,
+ }
+ 
+ static struct pipe_resource* sphaero_drm_resource_create(struct pipe_screen *ps,
+                                           const struct pipe_resource *templat) {
++
+    struct sphaero_screen* screen = (struct sphaero_screen*)ps;
+    struct sphaero_resource* ret = CALLOC_STRUCT(sphaero_resource);
+    ret->pr = *templat;
+    ret->pr.screen = ps;
+-   struct drm_sphaero_create_gl_tex create_req = {
+-      .width = ret->pr.width0,
+-      .height = ret->pr.height0,
+-   };
+-   if (drmIoctl(screen->fd, DRM_IOCTL_SPHAERO_CREATE_GL_TEX, &create_req)) {
+-      // FIXME: Free resource
+-      printf("create tex failed\n");
+-      // FIXME: Check if this is legal
+-      return NULL;
++
++   if (templat->target == PIPE_BUFFER) {
++      if (sphaero_alloc_gpu_obj(screen->fd, templat->width0, &ret->handle)) {
++         fprintf(stderr, "alloc gpu obj failed\n");
++         return NULL;
++      }
++
++      return &ret->pr;
++   } else {
++      struct drm_sphaero_create_gl_tex create_req = {
++         .width = ret->pr.width0,
++         .height = ret->pr.height0,
++      };
++      if (drmIoctl(screen->fd, DRM_IOCTL_SPHAERO_CREATE_GL_TEX, &create_req)) {
++         fprintf(stderr, "create tex failed\n");
++         return NULL;
++      }
++      ret->handle = create_req.handle;
+    }
+    pipe_reference_init(&ret->pr.reference, 1);
+-   ret->handle = create_req.handle;
+    return &ret->pr;
+ }
+ 
+ static bool sphaero_drm_resource_get_handle(struct pipe_screen *screen,
+-- 
+2.44.1
+
