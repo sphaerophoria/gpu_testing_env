@@ -1,0 +1,206 @@
+From 0140d15eb44538991773c69dadfde96cd48d07d5 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Fri, 18 Oct 2024 19:32:14 +0000
+Subject: [PATCH 5/8] Implement direct GPU memory mapping
+
+In preparation for OpenGL shaders in userspace, we need some way to
+upload data to the GPU. Previously we were working on the model that
+memory lives in system RAM, and then the GPU looks at that ram when it
+wants to modify it. This scheme is undesirable as we start implementing
+more complex behavior
+
+The thought here was that we can allocate memory on the GPU, and expose
+it through a BAR for access on CPU. We add some commands to allocate
+data, and map GPU objects to an address range in a 256MB (max size
+without resizeable BAR)
+
+This turned out to be a pretty bad idea. Doing bulk transfers through
+this mechanism is incredibly slow as qemu has to service each write.
+It's already implemented though so we might as well leave it in
+---
+ hw/misc/sphaero.c | 97 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 97 insertions(+)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index 741dabf05..a17140da4 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -9,8 +9,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(SphaeroState, SPHAERO)
+ #define SPHAERO_OUTPUT_HEIGHT 768
+ #define NUM_PIXELS (SPHAERO_OUTPUT_WIDTH * SPHAERO_OUTPUT_HEIGHT)
+ #define PIXELS_SIZE (NUM_PIXELS * 4)
+ 
++#define SPHAERO_PAGE_BAR_SIZE (256 * 1024 * 1024)
++#define SPHAERO_PAGE_SIZE 4096
++#define SPHAERO_NUM_BAR_PAGES (SPHAERO_PAGE_BAR_SIZE / SPHAERO_PAGE_SIZE)
++
+ typedef enum SphaeroRegCommand {
+     SPHAERO_REG_CMD_PUSH_FB_CHUNK,
+     SPHAERO_REG_CMD_COMMIT_FB,
+     SPHAERO_REG_CMD_SET_VB_SIZE,
+@@ -20,8 +24,11 @@ typedef enum SphaeroRegCommand {
+     SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM,
+     SPHAERO_REG_CMD_CREATE_GL_TEX,
+     SPHAERO_REG_CMD_GL_CLEAR,
+     SPHAERO_REG_CMD_SET_HW_FB,
++    SPHAERO_REG_CMD_ALLOC_HW_BUF,
++    SPHAERO_REG_CMD_MAP_HW_BUF,
++    SPHAERO_REG_CMD_SET_DUMB_FB,
+     SPHAERO_REG_CMD_MAX,
+ } SphaeroRegCommand;
+ 
+ #define SPHAERO_NUM_ARG_REGS 10
+@@ -77,18 +84,22 @@ typedef struct SphaeroState
+     PCIDevice parent_obj;
+ 
+     AddressSpace* as;
+     MemoryRegion bar;
++    MemoryRegion mapped_gpu_mem_bar;
+ 
+     QemuConsole* console;
+ 
+     uint32_t args[SPHAERO_NUM_ARG_REGS];
+ 
+     uint64_t transform_address;
+ 
++    void* pages[SPHAERO_NUM_BAR_PAGES];
++
+     struct {
+         QemuMutex lock;
+         GHashTable *textures;
++        GHashTable *dumb;
+     } texture_protected;
+ 
+     SphaeroPushBuf pixels[2];
+     bool display_idx;
+@@ -227,8 +238,44 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+ 
+             qemu_mutex_unlock(&s->texture_protected.lock);
+             break;
+         }
++        case SPHAERO_REG_CMD_ALLOC_HW_BUF: {
++            uint64_t* hw_id = (uint64_t*)s->args;
++            uint64_t* size = (uint64_t*)(s->args + 2);
++
++            uint8_t* buf = malloc(*size);
++
++            qemu_mutex_lock(&s->texture_protected.lock);
++            g_hash_table_insert(s->texture_protected.dumb, GINT_TO_POINTER(*hw_id), buf);
++            qemu_mutex_unlock(&s->texture_protected.lock);
++            break;
++        }
++        case SPHAERO_REG_CMD_MAP_HW_BUF: {
++            uint64_t hw_id = *(uint64_t*)s->args;
++            uint32_t page_offs = *(s->args + 2);
++            uint32_t dest_page = *(s->args + 3);
++
++            qemu_mutex_lock(&s->texture_protected.lock);
++            void* buf = g_hash_table_lookup(s->texture_protected.dumb, GINT_TO_POINTER(hw_id));
++            s->pages[dest_page] = (buf + page_offs * SPHAERO_PAGE_SIZE);
++            qemu_mutex_unlock(&s->texture_protected.lock);
++            break;
++        }
++        case SPHAERO_REG_CMD_SET_DUMB_FB: {
++            assert(sphaero_is_little_endian());
++
++            qemu_mutex_lock(&s->texture_protected.lock);
++
++            uint64_t* handle = (uint64_t*)s->args;
++            void* buf = g_hash_table_lookup(s->texture_protected.dumb, GINT_TO_POINTER(*handle));
++            DisplaySurface* ds = qemu_create_displaysurface_from(1024, 768, PIXMAN_a8r8g8b8, 1024 * 4, buf);
++            dpy_gfx_replace_surface(s->console, ds);
++            dpy_gfx_update_full(s->console);
++
++            qemu_mutex_unlock(&s->texture_protected.lock);
++            break;
++        }
+         case SPHAERO_REG_CMD_MAX:
+             assert(false);
+             return;
+     }
+@@ -258,13 +305,58 @@ static uint64_t sphaero_read(void *opaque,
+                  unsigned size) {
+     return ~0;
+ }
+ 
++typedef struct  {
++    // FIXME: Writes can overrun the end of the array if the write is at an addr
++    // towards the end of the page
++    uint64_t *elem;
++    uint64_t mask;
++} SphaeroBarPageAddr;
++
++static SphaeroBarPageAddr sphaero_resolve_bar_addr(SphaeroState* s, hwaddr addr, unsigned size) {
++    // FIXME: null check
++    const int64_t page  = addr / SPHAERO_PAGE_SIZE;
++    const int64_t offs = addr % SPHAERO_PAGE_SIZE;
++
++    const void* base_addr = s->pages[page];
++    uint64_t* elem = (uint64_t*)(base_addr + offs);
++    const uint64_t mask = (1UL << (size * 8)) - 1;
++
++    return (SphaeroBarPageAddr){
++        .elem = elem,
++        .mask = mask,
++    };
++}
++static void sphaero_mapped_gpu_mem_write(void *opaque,
++                  hwaddr addr,
++                  uint64_t data,
++                  unsigned size) {
++    SphaeroState* s = opaque;
++    SphaeroBarPageAddr bar_addr = sphaero_resolve_bar_addr(s, addr, size);
++    *bar_addr.elem &= ~bar_addr.mask;
++    *bar_addr.elem |= data & bar_addr.mask;
++}
++
++static uint64_t sphaero_mapped_gpu_mem_read(void *opaque,
++                 hwaddr addr,
++                 unsigned size) {
++    SphaeroState* s = opaque;
++    SphaeroBarPageAddr bar_addr = sphaero_resolve_bar_addr(s, addr, size);
++
++    return *bar_addr.elem & bar_addr.mask;
++}
++
+ static const MemoryRegionOps sphaero_ops = {
+     .write = sphaero_write,
+     .read = sphaero_read,
+ };
+ 
++static const MemoryRegionOps sphaero_mapped_gpu_mem_ops = {
++    .write = sphaero_mapped_gpu_mem_write,
++    .read = sphaero_mapped_gpu_mem_read,
++};
++
+ static const GraphicHwOps sphaero_gpu_ops = {};
+ 
+ static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
+ {
+@@ -272,9 +364,13 @@ static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
+ 
+     memory_region_init_io(&s->bar, OBJECT(s), &sphaero_ops, s,
+                           "sphaero", 128);
+ 
++    memory_region_init_io(&s->mapped_gpu_mem_bar, OBJECT(s), &sphaero_mapped_gpu_mem_ops, s,
++                          "sphaero_gpu_mem", 256 * 1024 * 1024);
++
+     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
++    pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mapped_gpu_mem_bar);
+ 
+     s->as = pci_get_address_space(dev);
+     s->display_idx = false;
+     s->pixels[0] = sphaero_pixel_buf_create();
+@@ -282,8 +378,9 @@ static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
+     s->console = graphic_console_init(DEVICE(dev), 0, &sphaero_gpu_ops, s);
+ 
+     qemu_mutex_init(&s->texture_protected.lock);
+     s->texture_protected.textures = g_hash_table_new(NULL, NULL);
++    s->texture_protected.dumb = g_hash_table_new(NULL, NULL);
+ }
+ 
+ static void sphaero_class_init(ObjectClass *klass, void *data)
+ {
+-- 
+2.44.1
+

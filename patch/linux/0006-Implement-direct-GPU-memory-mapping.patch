@@ -1,0 +1,254 @@
+From 8964c14298cd82ffab12be734e8fa14599a16d9a Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Fri, 18 Oct 2024 19:32:00 +0000
+Subject: [PATCH] Implement direct GPU memory mapping
+
+Update dumb buffer to use GPU memory directly using new device APIs.
+Implement mmap fault handler to request that the GPU exposes the correct
+memory for a given fault
+
+Paging is fairly simple for now. We assume that the last mapped page is
+also the last used page. We evict the oldest map when we run out of
+room. This is not necessarily true, but after getting this wrong a few
+times we should end up seeing frequently used pages end up towards the
+front of the circular buffer
+---
+ drivers/gpu/drm/sphaero/sphaero_drv.c | 143 ++++++++++++++++++++++----
+ 1 file changed, 121 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/sphaero/sphaero_drv.c b/drivers/gpu/drm/sphaero/sphaero_drv.c
+index 5994f302a..49d090b2a 100644
+--- a/drivers/gpu/drm/sphaero/sphaero_drv.c
++++ b/drivers/gpu/drm/sphaero/sphaero_drv.c
+@@ -38,8 +38,11 @@ enum sphaero_reg_cmd {
+ 	SPHAERO_REG_CMD_PUSH_MODEL_TRANSFORM,
+ 	SPHAERO_REG_CMD_CREATE_GL_TEX,
+ 	SPHAERO_REG_CMD_GL_CLEAR,
+ 	SPHAERO_REG_CMD_SET_HW_FB,
++	SPHAERO_REG_CMD_ALLOC_HW_BUF,
++	SPHAERO_REG_CMD_MAP_HW_BUF,
++	SPHAERO_REG_CMD_SET_DUMB_FB,
+ 	SPHAERO_REG_CMD_MAX,
+ };
+ 
+ 
+@@ -49,16 +52,52 @@ static const struct pci_device_id pci_table[] = {
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_SPHAERO, PCI_DEVICE_ID_SPHAERO), },
+ 	{ },
+ };
+ 
++#define SPHAERO_PAGE_BAR_SIZE (256 * 1024 * 1024)
++#define SPHAERO_NUM_BAR_PAGES (SPHAERO_PAGE_BAR_SIZE >> PAGE_SHIFT)
++
++struct sphaero_vma_mapped_page {
++	struct vm_area_struct* vma;
++	u32 page_offset;
++};
++
++struct sphaero_bar_mappings {
++	struct sphaero_vma_mapped_page bar_pages[SPHAERO_NUM_BAR_PAGES];
++
++	// head - tail always less than SPHAERO_NUM_BAR_PAGES
++	u32 head; // always in range [0, 2 * SPHAERO_NUM_BAR_PAGES)
++	u32 tail; // always in range [0, SPHAERO_NUM_BAR_PAGES)
++};
++
++static bool sphaero_bar_mappings_full(struct sphaero_bar_mappings* mappings) {
++	return (mappings->head - mappings->tail) == SPHAERO_NUM_BAR_PAGES;
++}
++
++static void sphaero_bar_mappings_push_head(struct sphaero_bar_mappings* mappings, struct sphaero_vma_mapped_page page) {
++	mappings->bar_pages[mappings->head % SPHAERO_NUM_BAR_PAGES] = page;
++	mappings->head++;
++}
++
++static struct sphaero_vma_mapped_page sphaero_bar_mappings_pop_tail(struct sphaero_bar_mappings* mappings) {
++	struct sphaero_vma_mapped_page ret = mappings->bar_pages[mappings->tail++];
++	if (mappings->tail >= SPHAERO_NUM_BAR_PAGES) {
++		mappings->tail -= SPHAERO_NUM_BAR_PAGES;
++		mappings->head -= SPHAERO_NUM_BAR_PAGES;
++	}
++	return ret;
++}
+ 
+ // FIXME: Threading is completely ignored by our driver at the moment
+ struct sphaero_priv {
+ 	volatile uint32_t __iomem* regs;
++	phys_addr_t mapped_gpu_mem;
+ 	struct drm_connector connector;
+ 	struct drm_encoder encoder;
+ 	struct drm_crtc crtc;
+ 	uint64_t hw_id;
++
++	struct sphaero_bar_mappings bar_mappings;
+ };
+ 
+ static void sphaero_conn_destroy(struct drm_connector *connector) {
+ 	// destroy function is called unguarded, and there are no existing
+@@ -139,21 +178,8 @@ static int sphaero_create_gem_shmem(struct drm_device* dev, struct drm_file* fil
+ 	drm_gem_object_put(&shmem_obj->base);
+ 	return rc;
+ }
+ 
+-static int sphaero_gpu_dumb_create(struct drm_file *file_priv,
+-		   struct drm_device *dev,
+-		   struct drm_mode_create_dumb *args) {
+-	if (args->bpp != SPHAERO_SUPPORTED_BITS_PER_PIX) {
+-		return -EINVAL;
+-	}
+-
+-	args->pitch = args-> width * SPHAERO_BYTES_PER_PIX;
+-	args->size = args->pitch * args->height;
+-
+-	return sphaero_create_gem_shmem(dev, file_priv, args->size, &args->handle);
+-}
+-
+ static const struct drm_plane_funcs sphaero_gpu_plane_funcs = {
+ 	.update_plane		= drm_atomic_helper_update_plane,
+ 	.disable_plane		= drm_atomic_helper_disable_plane,
+ 	.reset			= drm_atomic_helper_plane_reset,
+@@ -204,17 +230,62 @@ static int sphaero_do_size_prefixed_gem_xfer(struct sphaero_priv* priv, struct d
+ 
+ struct drm_gem_sphaero_obj {
+ 	struct drm_gem_object base;
+ 	uint64_t hw_id;
++	bool is_dumb;
+ };
+ 
+ static void sphaero_gem_object_free(struct drm_gem_object *obj) {
+ 	struct drm_gem_sphaero_obj* sphaero_obj = container_of(obj, struct drm_gem_sphaero_obj, base);
+ 	kfree(sphaero_obj);
+ }
+ 
++static vm_fault_t sphaero_gem_object_fault(struct vm_fault *vmf) {
++	struct vm_area_struct *vma = vmf->vma;
++	struct drm_gem_object *base = vma->vm_private_data;
++	struct drm_device *drm_dev = base->dev;
++	struct sphaero_priv *priv = drm_dev->dev_private;
++	struct drm_gem_sphaero_obj *obj = container_of(base, struct drm_gem_sphaero_obj, base);
++
++	u64 page_offs = (vmf->address - vma->vm_start) >> PAGE_SHIFT;
++
++	if (sphaero_bar_mappings_full(&priv->bar_mappings)) {
++		struct sphaero_vma_mapped_page to_unmap = sphaero_bar_mappings_pop_tail(&priv->bar_mappings);
++		unsigned long start = to_unmap.vma->vm_start + (to_unmap.page_offset << PAGE_SHIFT);
++		unsigned long end = min(start + PAGE_SIZE, to_unmap.vma->vm_end);
++		zap_vma_ptes(vma, start, end - start);
++	}
++
++	u32 dest_page_num = priv->bar_mappings.head % SPHAERO_NUM_BAR_PAGES;
++
++	priv->regs[1] = obj->hw_id;
++	priv->regs[2] = obj->hw_id >> 32;
++	priv->regs[3] = page_offs;
++	priv->regs[4] = dest_page_num;
++	priv->regs[0] = SPHAERO_REG_CMD_MAP_HW_BUF;
++
++	const phys_addr_t phys_addr = priv->mapped_gpu_mem + dest_page_num * PAGE_SIZE;
++	const unsigned long pfn = phys_addr >> PAGE_SHIFT;
++
++	int ret = vmf_insert_pfn(vma, vmf->address, pfn);
++
++	struct sphaero_vma_mapped_page inserted_page = {
++		.vma = vmf->vma,
++		.page_offset = page_offs,
++	};
++	sphaero_bar_mappings_push_head(&priv->bar_mappings, inserted_page);
++	return ret;
++}
++
++static const struct vm_operations_struct sphaero_gem_object_vm_ops = {
++	.open = drm_gem_vm_open,
++	.close = drm_gem_vm_close,
++	.fault = sphaero_gem_object_fault
++};
++
+ static const struct drm_gem_object_funcs sphaero_gem_funcs = {
+-	.free = sphaero_gem_object_free
++	.free = sphaero_gem_object_free,
++	.vm_ops = &sphaero_gem_object_vm_ops
+ };
+ 
+ static struct drm_gem_sphaero_obj* drm_gem_sphaero_create(struct drm_device* dev, size_t size) {
+ 	struct sphaero_priv *priv = dev->dev_private;
+@@ -234,8 +305,35 @@ static struct drm_gem_sphaero_obj* drm_gem_sphaero_create(struct drm_device* dev
+ 	kfree(sphaero_obj);
+ 	return ERR_PTR(rc);
+ }
+ 
++static int sphaero_gpu_dumb_create(struct drm_file *file_priv,
++		   struct drm_device *dev,
++		   struct drm_mode_create_dumb *args) {
++	if (args->bpp != SPHAERO_SUPPORTED_BITS_PER_PIX) {
++		return -EINVAL;
++	}
++
++	args->pitch = args->width * SPHAERO_BYTES_PER_PIX;
++	args->size = args->pitch * args->height;
++
++	struct drm_gem_sphaero_obj *obj = drm_gem_sphaero_create(dev, args->size);
++	obj->is_dumb = true;
++
++	struct sphaero_priv* priv = dev->dev_private;
++	priv->regs[1] = obj->hw_id;
++	priv->regs[2] = obj->hw_id >> 32;
++	priv->regs[3] = args->size;
++	priv->regs[4] = args->size >> 32;
++	priv->regs[0] = SPHAERO_REG_CMD_ALLOC_HW_BUF;
++
++	int rc = drm_gem_handle_create(file_priv, &obj->base, &args->handle);
++
++	// Handle increases reference count, we need to release our ref
++	drm_gem_object_put(&obj->base);
++	return rc;
++}
++
+ static void sphaero_gpu_plane_update(struct drm_plane *plane,
+ 		      struct drm_atomic_state *state) {
+ 	struct drm_device* drm_dev = plane->dev;
+ 	struct sphaero_priv* priv = drm_dev->dev_private;
+@@ -245,23 +343,23 @@ static void sphaero_gpu_plane_update(struct drm_plane *plane,
+ 		return;
+ 	}
+ 
+ 	struct drm_gem_object* gem_obj = plane->state->fb->obj[0];
++	struct drm_gem_sphaero_obj* sphaero_obj = container_of(gem_obj, struct drm_gem_sphaero_obj, base);
+ 
+-	if (gem_obj->funcs == &sphaero_gem_funcs) {
+-		struct drm_gem_sphaero_obj* sphaero_obj = container_of(gem_obj, struct drm_gem_sphaero_obj, base);
++	if (sphaero_obj->is_dumb) {
+ 		priv->regs[1] = sphaero_obj->hw_id;
+ 		priv->regs[2] = sphaero_obj->hw_id >> 32;
+-		priv->regs[0] = SPHAERO_REG_CMD_SET_HW_FB;
++		priv->regs[3] = plane->state->fb->width;
++		priv->regs[4] = plane->state->fb->height;
++		priv->regs[0] = SPHAERO_REG_CMD_SET_DUMB_FB;
+ 		return;
+ 	} else {
+-		// We have not yet implemented mmap for hardware backed buffers,
+-		// which means the DUMB workflow cannot be supported by our object.
+-		sphaero_do_gem_xfer(priv, gem_obj, SPHAERO_REG_CMD_PUSH_FB_CHUNK, true);
+-		priv->regs[0] = SPHAERO_REG_CMD_COMMIT_FB;
++		priv->regs[1] = sphaero_obj->hw_id;
++		priv->regs[2] = sphaero_obj->hw_id >> 32;
++		priv->regs[0] = SPHAERO_REG_CMD_SET_HW_FB;
+ 		return;
+ 	}
+-
+ }
+ 
+ static const struct drm_plane_helper_funcs sphaero_gpu_primary_helper_funcs = {
+ 	.atomic_update		= sphaero_gpu_plane_update,
+@@ -323,8 +421,9 @@ static int sphaero_pci_init(struct pci_dev *pdev, struct sphaero_priv* priv) {
+ 		pci_disable_device(pdev);
+ 	}
+ 
+ 	resource_size_t pciaddr = pci_resource_start(pdev, 0);
++	priv->mapped_gpu_mem = pci_resource_start(pdev, 1);
+ 
+ 	priv->regs = ioremap(pciaddr, 128);
+ 	return rc;
+ }
+-- 
+2.44.1
+
