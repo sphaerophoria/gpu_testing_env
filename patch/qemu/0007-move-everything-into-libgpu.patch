@@ -1,0 +1,111 @@
+From 545399cab31fae88dc628fcd1a00bdf8872ce6d5 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 21 Oct 2024 14:04:26 -0700
+Subject: [PATCH 7/8] move everything into libgpu
+
+---
+ hw/misc/sphaero.c | 49 +++++++++++++++++++++++++----------------------
+ 1 file changed, 26 insertions(+), 23 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index e867157b6..d4704c9e7 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -53,13 +53,8 @@ typedef struct SphaeroState
+ 
+     void* pages[SPHAERO_NUM_BAR_PAGES];
+ 
+     struct libgpu_gpu* gpu;
+-
+-    struct {
+-        QemuMutex lock;
+-        GHashTable *dumb;
+-    } texture_protected;
+ } SphaeroState;
+ 
+ 
+ static bool sphaero_is_little_endian(void) {
+@@ -127,41 +122,53 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+ 
+             break;
+         }
+         case SPHAERO_REG_CMD_ALLOC_HW_BUF: {
++            assert(sphaero_is_little_endian());
+             uint64_t* hw_id = (uint64_t*)s->args;
+             uint64_t* size = (uint64_t*)(s->args + 2);
+ 
+-            uint8_t* buf = malloc(*size);
+-
+-            qemu_mutex_lock(&s->texture_protected.lock);
+-            g_hash_table_insert(s->texture_protected.dumb, GINT_TO_POINTER(*hw_id), buf);
+-            qemu_mutex_unlock(&s->texture_protected.lock);
++            libgpu_gpu_create_dumb(s->gpu, *hw_id, *size);
++            void* buf;
++            libgpu_gpu_get_dumb(s->gpu, *hw_id, &buf);
+             break;
+         }
+         case SPHAERO_REG_CMD_MAP_HW_BUF: {
+             uint64_t hw_id = *(uint64_t*)s->args;
+             uint32_t page_offs = *(s->args + 2);
+             uint32_t dest_page = *(s->args + 3);
+ 
+-            qemu_mutex_lock(&s->texture_protected.lock);
+-            void* buf = g_hash_table_lookup(s->texture_protected.dumb, GINT_TO_POINTER(hw_id));
++            void* buf;
++            if (!libgpu_gpu_get_dumb(s->gpu, hw_id, &buf)) {
++                printf("Failed to map %d\n", dest_page);
++                break;
++            }
+             s->pages[dest_page] = (buf + page_offs * SPHAERO_PAGE_SIZE);
+-            qemu_mutex_unlock(&s->texture_protected.lock);
+             break;
+         }
+         case SPHAERO_REG_CMD_SET_DUMB_FB: {
+             assert(sphaero_is_little_endian());
+ 
+-            qemu_mutex_lock(&s->texture_protected.lock);
+-
+             uint64_t* handle = (uint64_t*)s->args;
+-            void* buf = g_hash_table_lookup(s->texture_protected.dumb, GINT_TO_POINTER(*handle));
+-            DisplaySurface* ds = qemu_create_displaysurface_from(1024, 768, PIXMAN_a8r8g8b8, 1024 * 4, buf);
++            uint32_t width = *(s->args + 2);
++            uint32_t height = *(s->args + 3);
++
++            void* buf;
++            // FIXME: Thread safety here seems a little sketchy. If libgpu is
++            // "thread safe" this call would mutex lock internally, however it
++            // returns a reference to data. We probably need to have some
++            // reference counting externally so that libgpu knows when it is
++            // allowed to free a buffer or not or something. Maybe it's fine
++            // because right now we don't ever actually release IDs :)
++            if (!libgpu_gpu_get_dumb(s->gpu, *handle, &buf)) {
++                break;
++            }
++
++            printf("Using buf of %u at %p\n", width * height * 4, buf);
++
++            DisplaySurface* ds = qemu_create_displaysurface_from(width, height, PIXMAN_a8r8g8b8, width * 4, buf);
+             dpy_gfx_replace_surface(s->console, ds);
+             dpy_gfx_update_full(s->console);
+-
+-            qemu_mutex_unlock(&s->texture_protected.lock);
+             break;
+         }
+         case SPHAERO_REG_CMD_MAX:
+             assert(false);
+@@ -260,12 +267,8 @@ static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
+     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mapped_gpu_mem_bar);
+ 
+     s->as = pci_get_address_space(dev);
+     s->console = graphic_console_init(DEVICE(dev), 0, &sphaero_gpu_ops, s);
+-
+-    qemu_mutex_init(&s->texture_protected.lock);
+-    s->texture_protected.dumb = g_hash_table_new(NULL, NULL);
+-
+     s->gpu = libgpu_gpu_create();
+ }
+ 
+ static void sphaero_class_init(ObjectClass *klass, void *data)
+-- 
+2.44.1
+
