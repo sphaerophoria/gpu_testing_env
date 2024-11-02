@@ -255,16 +255,19 @@ pub fn main() !void {
     c.glBindBuffer(c.GL_ARRAY_BUFFER, vbo);
 
     const vertices = [_]f32{
-        -0.5, -0.5, 0.0,
-        0.5, -0.5, 0.0,
-        0.0, 0.5, 0.0,
+        -1.37373871,  2.74747742, -3.42857143, 8.0, 0.0,
+        -1.37373871, -2.74747742, -3.42857143, 8.0, 0.0,
+         -1.37373871,   0.0,         -37.71428571, 38.0, 1.0,
     };
 
 
     c.glBufferData(c.GL_ARRAY_BUFFER, @intCast(@sizeOf(f32) * vertices.len), &vertices, c.GL_STATIC_DRAW);
 
-    c.glVertexAttribPointer(0, 3, c.GL_FLOAT, c.GL_FALSE, 3 * @sizeOf(f32), @ptrFromInt(0));
+    c.glVertexAttribPointer(0, 4, c.GL_FLOAT, c.GL_FALSE, 5 * @sizeOf(f32), @ptrFromInt(0));
     c.glEnableVertexAttribArray(0);
+
+    c.glVertexAttribPointer(1, 1, c.GL_FLOAT, c.GL_FALSE, 5 * @sizeOf(f32), @ptrFromInt(16));
+    c.glEnableVertexAttribArray(1);
 
     std.debug.print("success\n", .{});
 

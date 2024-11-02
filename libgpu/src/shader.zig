@@ -1,9 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const global = @import("global.zig");
-
-pub const Vec3 = [3]f32;
-pub const Vec4 = [4]f32;
+const lin = @import("lin.zig");
+const Vec3 = lin.Vec3;
+const Vec4 = lin.Vec4;
 
 const ReferenceType = enum {
     input,
@@ -59,6 +59,15 @@ const Command = union(enum) {
         input: [4]ChannelReference,
         output: u32,
     },
+    fmul: struct {
+        a: u32,
+        b: u32,
+        output: u32,
+    },
+    fsin: struct {
+        input: u32,
+        output: u32,
+    },
 };
 
 pub const ShaderInput = struct {
@@ -67,30 +76,50 @@ pub const ShaderInput = struct {
     stride: u32,
 };
 
+
+pub const ShaderOutput = struct {
+    marked: []Variable,
+    unmarked: []?Variable,
+
+    pub fn deinit(self: ShaderOutput, alloc: Allocator) void {
+        alloc.free(self.marked);
+        alloc.free(self.unmarked);
+    }
+};
+
+pub const SingleShaderOutput = struct {
+    marked: Variable,
+    // FIXME: This only supports a shader with 1 or 2 outputs
+    unmarked: ?Variable,
+};
+
 const ShaderExecutor = struct {
     alloc: Allocator,
     shader: Shader,
 
-    pub fn execute(self: ShaderExecutor, input_data: []const u8, input_defs: []const ShaderInput, num_indices: usize) ![]Variable {
-        const outputs = try self.alloc.alloc(Variable, num_indices);
+    pub fn executeOnBuf(self: ShaderExecutor, input_data: []const u8, input_defs: []const ShaderInput, num_indices: usize) !ShaderOutput {
+        const marked_outputs = try self.alloc.alloc(Variable, num_indices);
+        const unmarked_outputs = try self.alloc.alloc(?Variable, num_indices);
 
         for (0..num_indices) |group_idx| {
             const input_group = try extractInputsFromBuf(self.alloc, group_idx, input_data, input_defs);
             defer self.alloc.free(input_group);
 
             const one_ret =  try self.executeOnInputs(input_group);
-            defer self.alloc.free(one_ret);
 
-            std.debug.assert(one_ret.len == 1);
-            outputs[group_idx] = one_ret[0];
+            marked_outputs[group_idx] = one_ret.marked;
+            unmarked_outputs[group_idx] = one_ret.unmarked;
         }
-        return outputs;
+        return .{
+            .marked = marked_outputs,
+            .unmarked = unmarked_outputs,
+        };
     }
 
     // inputs may be modified
-    fn executeOnInputs(self: ShaderExecutor, inputs: []Variable) ![]Variable {
+    pub fn executeOnInputs(self: ShaderExecutor, inputs: []Variable) !SingleShaderOutput {
         const outputs = try makeShaderOutputs(self.alloc, self.shader.output_types);
-        errdefer self.alloc.free(outputs);
+        defer self.alloc.free(outputs);
 
         var ssas = std.AutoHashMapUnmanaged(u32, Variable){};
         defer ssas.deinit(self.alloc);
@@ -119,12 +148,26 @@ const ShaderExecutor = struct {
                     const y = try resolveChannelRef(m.input[1], inputs, outputs, ssas);
                     const z = try resolveChannelRef(m.input[2], inputs, outputs, ssas);
                     const w = try resolveChannelRef(m.input[3], inputs, outputs, ssas);
-                    try ssas.put(self.alloc, m.output, .{ .vec4 = Vec4 { x, y, z, w } });
+                    try ssas.put(self.alloc, m.output, .{ .vec4 = .{x, y, z, w }});
+                },
+                .fsin => |f| {
+                    const input = ssas.get(f.input) orelse return error.InvalidReference;
+                    try ssas.put(self.alloc, f.output , .{ .f32 = @sin(input.f32) });
+                },
+                .fmul => |f| {
+                    const a = ssas.get(f.a) orelse return error.InvalidReference;
+                    const b = ssas.get(f.b) orelse return error.InvalidReference;
+                    try ssas.put(self.alloc, f.output , .{ .f32 = a.f32 * b.f32 });
                 },
             }
         }
 
-        return outputs;
+        const unmarked: ?Variable  = if (outputs.len > 1) outputs[(self.shader.marked_output_pos + 1) % outputs.len] else null;
+
+        return .{
+            .marked = outputs[self.shader.marked_output_pos],
+            .unmarked = unmarked,
+        };
     }
 
     fn resolveReference(inputs: []Variable, outputs: []Variable, reference: Reference) !*Variable {
@@ -170,12 +213,24 @@ fn extractInputsFromBuf(alloc: Allocator, group_idx: usize, input_data: []const 
     errdefer alloc.free(inputs);
 
     for (input_defs, 0..) |def, input_idx| {
+        const input_start = def.offs + def.stride * group_idx;
         inputs[input_idx] = switch(def.typ) {
+            .f32 => blk: {
+                const input_end = input_start + @sizeOf(f32);
+                break :blk .{
+                    .f32 = std.mem.bytesToValue(f32, input_data[input_start..input_end])
+                };
+            },
             .vec3 => blk: {
-                const input_start = def.offs + def.stride * group_idx;
                 const input_end = input_start + @sizeOf(Vec3);
                 break :blk .{
                     .vec3 = std.mem.bytesToValue(Vec3, input_data[input_start..input_end])
+                };
+            },
+            .vec4 => blk: {
+                const input_end = input_start + @sizeOf(Vec4);
+                break :blk .{
+                    .vec4 = std.mem.bytesToValue(Vec4, input_data[input_start..input_end])
                 };
             },
             else => return error.UnimplementedInputParser,
@@ -195,6 +250,7 @@ pub const Shader = struct {
     commands: []Command,
     input_types: []VariableType,
     output_types: []VariableType,
+    marked_output_pos: usize,
 
     pub fn load(alloc: Allocator, data: []const u8) !Shader {
         const val = try std.json.parseFromSlice(Shader, alloc, data, .{});
@@ -204,6 +260,7 @@ pub const Shader = struct {
             .commands = try alloc.dupe(Command, val.value.commands),
             .input_types = try alloc.dupe(VariableType, val.value.input_types),
             .output_types = try alloc.dupe(VariableType, val.value.output_types),
+            .marked_output_pos = val.value.marked_output_pos,
         };
     }
 
@@ -213,13 +270,22 @@ pub const Shader = struct {
         alloc.free(self.output_types);
     }
 
-    pub fn execute(self: Shader, alloc: Allocator, vertex_buf: []const u8, format: []ShaderInput, num_elems: usize) ![]Variable {
+    pub fn executeOnBuf(self: Shader, alloc: Allocator, vertex_buf: []const u8, format: []ShaderInput, num_elems: usize) !ShaderOutput {
         const executor = ShaderExecutor {
             .alloc = alloc,
             .shader = self,
         };
 
-        return try executor.execute(vertex_buf, format, num_elems);
+        return try executor.executeOnBuf(vertex_buf, format, num_elems);
+    }
+
+    pub fn executeOnInputs(self: Shader, alloc: Allocator, inputs: []Variable) !SingleShaderOutput {
+        const executor = ShaderExecutor {
+            .alloc = alloc,
+            .shader = self,
+        };
+
+        return try executor.executeOnInputs(inputs);
     }
 };
 
@@ -229,6 +295,7 @@ pub const ShaderBuilder = struct {
     commands: std.ArrayListUnmanaged(Command) = .{},
     input_types: std.ArrayListUnmanaged(VariableType) = .{},
     output_types: std.ArrayListUnmanaged(VariableType) = .{},
+    marked_output_pos: usize = 0,
 
     pub fn deinit(self: *ShaderBuilder) void {
         self.input_types.deinit(self.alloc);
@@ -253,6 +320,7 @@ pub const ShaderBuilder = struct {
             .commands = self.commands.items,
             .input_types = self.input_types.items,
             .output_types =  self.output_types.items,
+            .marked_output_pos = self.marked_output_pos,
         };
 
         var output = std.ArrayList(u8).init(self.alloc);
@@ -260,6 +328,7 @@ pub const ShaderBuilder = struct {
         try std.json.stringify(to_stringify, .{
             .whitespace = .indent_2,
         }, writer);
+        std.debug.print("shader: \"{s}\"", .{output.items});
 
         return try output.toOwnedSlice();
     }
@@ -366,7 +435,7 @@ test "shader basic execution" {
             .stride = 12
         }
     };
-    const outputs = try shader.execute(alloc, std.mem.sliceAsBytes(input_buf), &shader_inputs, 4);
+    const outputs = try shader.executeOnBuf(alloc, std.mem.sliceAsBytes(input_buf), &shader_inputs, 4);
     defer alloc.free(outputs);
 
     try std.testing.expectEqual(4, outputs.len);

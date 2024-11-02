@@ -1,7 +1,11 @@
 #version 120
-attribute vec3 aPos;
+attribute vec4 aPos;
+attribute float x_pos;
+
+varying float frag_x_pos;
 
 void main()
 {
-        gl_Position = vec4(aPos, 1.0);
+        gl_Position = aPos;
+        frag_x_pos = x_pos;
 }

@@ -1,8 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const shader = @import("shader.zig");
-const Vec3 = shader.Vec3;
-const Vec4 = shader.Vec4;
+const lin = @import("lin.zig");
+const Vec3 = lin.Vec3;
+const Vec4 = lin.Vec4;
 const global = @import("global.zig");
 
 // FIXME: Check signature between defined functions and headers
@@ -82,13 +83,14 @@ const Gpu = struct {
         );
         defer inputs.deinit(self.alloc);
 
-        const vert_outputs = try inputs.vs.execute(self.alloc, inputs.vb, inputs.format, num_elems);
-        defer self.alloc.free(vert_outputs);
+        const vert_outputs = try inputs.vs.executeOnBuf(self.alloc, inputs.vb, inputs.format, num_elems);
+        defer vert_outputs.deinit(self.alloc);
 
-        const frag_outputs = try inputs.fs.execute(self.alloc, &.{}, &.{}, 1);
-        defer self.alloc.free(frag_outputs);
+        if (vert_outputs.marked.len < 3) {
+            return;
+        }
 
-        rasterizeTriangles(vert_outputs, frag_outputs, inputs.texture);
+        try rasterizeTriangles(self.alloc, vert_outputs, inputs.fs, inputs.texture);
    }
 };
 
@@ -149,110 +151,220 @@ fn lerpInt(a: anytype, b: anytype, start: anytype, end: anytype, val: anytype) @
         lerp_val));
 }
 
+fn findXForY(start: PixelCoord, end: PixelCoord, y: usize, max: u32) usize {
+    const y_f: f32 = @floatFromInt(y);
+    const lerp_val = (y_f - start.y) / (end.y - start.y);
+    return clampCastF32U32(std.math.lerp(start.x, end.x, lerp_val), 0, max);
+}
+
 const TriangleRasterizer = struct {
+    alloc: Allocator,
     texture_data_u32: []u32,
     texture_width_px: u32,
     texture_height_px: u32,
-    frag_color: u32,
+    frag_shader: shader.Shader,
 
-    fn rasterizeTriangle(self: TriangleRasterizer, sorted_triangle: [3]PixelCoord) void {
+    fn rasterizeTriangle(self: TriangleRasterizer, sorted_triangle: [3]PixelCoord, frag_inputs: [3]shader.Variable) !void {
         const a_px, const b_px, const c_px = sorted_triangle;
 
-        self.rasterizeHalfTriangle(c_px, b_px, c_px, a_px);
-        self.rasterizeHalfTriangle(b_px, a_px, c_px, a_px);
+        try self.rasterizeHalfTriangle(c_px, b_px, c_px, a_px, sorted_triangle, frag_inputs);
+        try self.rasterizeHalfTriangle(b_px, a_px, c_px, a_px, sorted_triangle, frag_inputs);
     }
 
-    fn rasterizeHalfTriangle(self: TriangleRasterizer, start: PixelCoord, end: PixelCoord, long_start: PixelCoord, long_end: PixelCoord) void {
-        const start_y  = @max(start[1], 0);
-        const end_y  = @min(end[1], self.texture_height_px);
+    fn rasterizeHalfTriangle(self: TriangleRasterizer, start: PixelCoord, end: PixelCoord, long_start: PixelCoord, long_end: PixelCoord, sorted_triangle: [3]PixelCoord, frag_inputs: [3]shader.Variable) !void {
+        const start_y: usize = clampCastF32U32(start.y, 0, self.texture_height_px);
+        const end_y: usize  = clampCastF32U32(end.y, 0, self.texture_height_px);
+
+        std.debug.print("start y: {d}, end y: {d}", .{start_y, end_y});
+
+        const total_area = lin.cross(
+            sorted_triangle[1].vec2() - sorted_triangle[0].vec2(),
+            sorted_triangle[2].vec2() - sorted_triangle[0].vec2(),
+        );
+        const bc = BaryCalculator {
+            .total_area = total_area,
+            .triangle = sorted_triangle,
+        };
 
         for (start_y..end_y) |y_px| {
-            const x1_px = lerpInt(long_start[0], long_end[0], long_start[1], long_end[1], y_px);
-            const x2_px = lerpInt(start[0], end[0], start[1], end[1], y_px);
-            const left = @max(@min(x1_px, x2_px), 0);
-            const right = @min(@max(x1_px, x2_px), self.texture_width_px);
+            const x1_px = findXForY(long_start, long_end, y_px, self.texture_width_px);
+            const x2_px = findXForY(start, end, y_px, self.texture_width_px);
+
+            const left = @min(x1_px, x2_px);
+            const right = @max(x1_px, x2_px);
+
             for (left..right) |x_px| {
-                self.texture_data_u32[y_px * self.texture_width_px + x_px] = self.frag_color;
+                const p = lin.Vec2{@floatFromInt(x_px), @floatFromInt(y_px)};
+                const bary_a, const bary_b, const bary_c = bc.calc(p);
+                const frag_input = try interpolateVars(frag_inputs, bary_a, bary_b, bary_c);
+
+                var frag_inputs_mut = [1]shader.Variable{frag_input};
+                const frag_output = try self.frag_shader.executeOnInputs(self.alloc, &frag_inputs_mut);
+                const color = vec4ColorToU32(frag_output.marked.vec4);
+                self.texture_data_u32[y_px * self.texture_width_px + x_px] = color;
             }
         }
     }
 };
 
-pub const PixelCoord = [2]u32;
+const BaryCalculator = struct {
+    total_area: f32,
+    triangle: [3]PixelCoord,
 
-pub fn norm_to_pix_coord(coord: Vec3, width: u32, height: u32) PixelCoord {
+    fn calc(self: BaryCalculator, p: lin.Vec2) [3]f32 {
+        const pa = p - self.triangle[0].vec2();
+        const pb = p - self.triangle[1].vec2();
+        const pc = p - self.triangle[2].vec2();
+
+        const bary_projected_a = lin.cross(pb, pc) / self.total_area;
+        const bary_projected_b = lin.cross(pc, pa) / self.total_area;
+        const bary_projected_c = lin.cross(pa, pb) / self.total_area;
+
+        const bary_a_inter = bary_projected_a / self.triangle[0].w;
+        const bary_b_inter = bary_projected_b / self.triangle[1].w;
+        const bary_c_inter = bary_projected_c / self.triangle[2].w;
+
+        const bary_denom = bary_a_inter + bary_b_inter + bary_c_inter;
+
+        return .{
+            bary_a_inter / bary_denom,
+            bary_b_inter / bary_denom,
+            bary_c_inter / bary_denom,
+        };
+    }
+};
+
+
+fn clampCastF32U32(val: f32, min: u32, max: u32) u32 {
+    const min_f: f32 = @floatFromInt(min);
+    const max_f: f32 = @floatFromInt(max);
+    if (val <= min_f) return min;
+    if (val >= max_f) return max;
+
+    return @intFromFloat(val);
+}
+
+const PixelCoord = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+
+    pub fn vec2(self: PixelCoord) lin.Vec2 {
+        return .{self.x, self.y};
+    }
+};
+
+fn interpolateVars(v: [3]shader.Variable, a: f32, b: f32, c: f32) !shader.Variable {
+    if (std.meta.activeTag(v[0]) != std.meta.activeTag(v[1])
+        or std.meta.activeTag(v[0]) != std.meta.activeTag(v[2])
+) {
+        return error.TypesNotMatched;
+    }
+
+    switch(v[0]) {
+        .f32 => {
+            return .{
+                .f32 = a * v[0].f32 + b * v[1].f32 + c * v[2].f32,
+            };
+        },
+        else => {
+            return error.UnhandledInterpolation;
+        }
+    }
+}
+
+pub fn homogenousToPixelCoord(coord: Vec4, width: u32, height: u32) PixelCoord {
     const height_f: f32 = @floatFromInt(height);
+    const x_norm = coord[0] / coord[3];
+    const y_norm = coord[1] / coord[3];
+    const w_norm = coord[3];
     return PixelCoord {
-        @intFromFloat((coord[0] + 1.0) / 2 * @as(f32, @floatFromInt(width))),
-        @intFromFloat(height_f * (1.0 - (coord[1] + 1.0) / 2)),
+        .x = (x_norm + 1.0) / 2 * @as(f32, @floatFromInt(width)),
+        .y = height_f * (1.0 - (y_norm + 1.0) / 2),
+        .w = w_norm,
     };
 }
 
-pub fn homogenous_to_vec3(coord: Vec4) Vec3 {
-    // FIXME: divide by 0
-    // NOTE: rcrnstn claims that some people use w == 0 to mean do not draw
-    // but thinks it's not in spec
-    return Vec3{
-        coord[0] / coord[3],
-        coord[1] / coord[3],
-        coord[2] / coord[3],
-    };
-
-}
-
-fn homogeneousToSortedPixelCoords(homogenous_coords: [3]shader.Vec4, texture_width_px: u32, texture_height_px: u32) [3]PixelCoord {
+fn homogeneousToPixelCoords(homogenous_coords: [3]Vec4, texture_width_px: u32, texture_height_px: u32) [3]PixelCoord {
     var coords: [3]PixelCoord = undefined;
 
     for (homogenous_coords, 0..) |homogenous_coord, i| {
-        const norm = homogenous_to_vec3(homogenous_coord);
-        coords[i] = norm_to_pix_coord(norm, texture_width_px, texture_height_px);
+        coords[i] = homogenousToPixelCoord(homogenous_coord, texture_width_px, texture_height_px);
     }
-
-    const smallerY = struct {
-        fn f(_: void, lhs: PixelCoord, rhs: PixelCoord) bool {
-            return rhs[1] < lhs[1];
-        }
-    }.f;
-
-    std.mem.sort(PixelCoord, &coords, {}, smallerY);
     return coords;
 }
 
-fn vec4ColorToU32(color: shader.Vec4) u32 {
+fn sortCoordsByPixelY(pixel_coords: [3]PixelCoord) [3]u8 {
+    var ret: [3]u8 = .{ 0, 1, 2 };
+
+    const greaterY = struct {
+        fn f(ctx: []const PixelCoord, lhs: u8, rhs: u8) bool {
+            return ctx[rhs].y < ctx[lhs].y;
+        }
+    }.f;
+
+    const coords_slice: []const PixelCoord = &pixel_coords;
+
+    std.mem.sort(u8, &ret, coords_slice, greaterY);
+    return ret;
+}
+
+fn colorComponentTou32(color: f32, shift: u5) u32 {
+    return @as(u32, @intFromFloat(std.math.clamp(color * 255.0, 0.0, 255.0))) << shift;
+}
+
+fn vec4ColorToU32(color: Vec4) u32 {
     var frag_color_u32: u32 = 0;
-    frag_color_u32 |= @intFromFloat(color[2] * 255); // b
-    frag_color_u32 |= @as(u32, @intFromFloat(color[1] * 255)) << 8; // g
-    frag_color_u32 |= @as(u32, @intFromFloat(color[0] * 255)) << 16; // r
-    frag_color_u32 |= @as(u32, @intFromFloat(color[3] * 255)) << 24; // a
+    frag_color_u32 |= colorComponentTou32(color[2], 0); // b
+    frag_color_u32 |= colorComponentTou32(color[1], 8); // g
+    frag_color_u32 |= colorComponentTou32(color[0], 16); // r
+    frag_color_u32 |= colorComponentTou32(color[3], 24); // a
     return frag_color_u32;
 }
 
-fn rasterizeTriangles(vert_outputs: []shader.Variable, frag_outputs: []shader.Variable, texture: Texture) void {
-    const frag_color = vec4ColorToU32(frag_outputs[0].vec4);
-
+fn rasterizeTriangles(alloc: Allocator, vert_outputs: shader.ShaderOutput, frag_shader: shader.Shader, texture: Texture) !void {
     const rasterizer = TriangleRasterizer {
+        .alloc = alloc,
         .texture_data_u32 = @alignCast(std.mem.bytesAsSlice(u32, texture.data)),
         .texture_height_px = texture.calcHeight(),
         .texture_width_px = texture.width_px,
-        .frag_color = frag_color,
+        .frag_shader = frag_shader,
     };
 
-    for (0..vert_outputs.len / 3) |triangle_idx| {
+    for (0..vert_outputs.marked.len / 3) |triangle_idx| {
         const base = triangle_idx * 3;
 
-        const coords: [3]shader.Vec4 = .{
-            vert_outputs[base].vec4,
-            vert_outputs[base + 1].vec4,
-            vert_outputs[base + 2].vec4,
+        const coords: [3]Vec4 = .{
+            vert_outputs.marked[base].vec4,
+            vert_outputs.marked[base + 1].vec4,
+            vert_outputs.marked[base + 2].vec4,
         };
 
-        const pixel_coords = homogeneousToSortedPixelCoords(
+        // FIXME: What if the shader has no inputs
+        // FIXME: What if the input is not a vec3
+        const frag_inputs: [3]shader.Variable = .{
+            vert_outputs.unmarked[base].?,
+            vert_outputs.unmarked[base + 1].?,
+            vert_outputs.unmarked[base + 2].?,
+        };
+
+        const pixel_coords = homogeneousToPixelCoords(
             coords,
             rasterizer.texture_width_px,
             rasterizer.texture_height_px,
         );
 
-        rasterizer.rasterizeTriangle(pixel_coords);
+        const sorted_indices = sortCoordsByPixelY(pixel_coords);
+
+        try rasterizer.rasterizeTriangle(.{
+            pixel_coords[sorted_indices[0]],
+            pixel_coords[sorted_indices[1]],
+            pixel_coords[sorted_indices[2]],
+        }, .{
+            frag_inputs[sorted_indices[0]],
+            frag_inputs[sorted_indices[1]],
+            frag_inputs[sorted_indices[2]],
+        });
     }
 }
 

@@ -1,8 +1,11 @@
 const std = @import("std");
 const shader_mod = @import("shader.zig");
 const global = @import("global.zig");
+const lin = @import("lin.zig");
 const ShaderBuilder = shader_mod.ShaderBuilder;
 const ShaderInputBuilder = std.ArrayList(shader_mod.ShaderInput);
+const Vec3 = lin.Vec3;
+const Vec4 = lin.Vec4;
 
 pub export fn libgpu_create_shader() ?*ShaderBuilder {
     const alloc = global.gpa.allocator();
@@ -11,12 +14,38 @@ pub export fn libgpu_create_shader() ?*ShaderBuilder {
     return shader;
 }
 
+pub export fn libgpu_shader_push_input_float(shader: *ShaderBuilder) bool {
+    shader.pushInput(.f32) catch return false;
+    return true;
+}
+
 pub export fn libgpu_shader_push_input_vec3(shader: *ShaderBuilder) bool {
     shader.pushInput(.vec3) catch return false;
     return true;
 }
 
+pub export fn libgpu_shader_push_input_vec4(shader: *ShaderBuilder) bool {
+    shader.pushInput(.vec4) catch return false;
+    return true;
+}
+
+pub export fn libgpu_shader_push_output_float(shader: *ShaderBuilder) bool {
+    shader.pushOutput(.f32) catch return false;
+    return true;
+}
+
 pub export fn libgpu_shader_push_output_vec4(shader: *ShaderBuilder) bool {
+    shader.pushOutput(.vec4) catch return false;
+    return true;
+}
+
+pub export fn libgpu_shader_push_output_vec3(shader: *ShaderBuilder) bool {
+    shader.pushOutput(.vec3) catch return false;
+    return true;
+}
+
+pub export fn libgpu_shader_push_output_vertex_position(shader: *ShaderBuilder) bool {
+    shader.marked_output_pos = shader.output_types.items.len;
     shader.pushOutput(.vec4) catch return false;
     return true;
 }
@@ -131,6 +160,27 @@ pub export fn libgpu_shader_push_command_mov4(
     return true;
 }
 
+pub export fn  libgpu_shader_push_command_fsin(shader: *ShaderBuilder, id: u32, input_id: u32) bool {
+    shader.pushCommand(.{
+        .fsin = .{
+            .input = input_id,
+            .output = id,
+        },
+    }) catch return false;
+    return true;
+}
+
+pub export fn  libgpu_shader_push_command_fmul(shader: *ShaderBuilder, id: u32, a_id: u32, b_id: u32) bool {
+    shader.pushCommand(.{
+        .fmul = .{
+            .a = a_id,
+            .b = b_id,
+            .output = id,
+        },
+    }) catch return false;
+    return true;
+}
+
 pub export fn libgpu_compile_shader(shader: *ShaderBuilder, data_opt: ?**anyopaque, len_opt: ?*usize) bool {
     const ret = shader.compile() catch return false;
     const data = data_opt orelse return false;
@@ -152,9 +202,29 @@ pub export fn libgpu_shader_free_input_defs(defs: ?*ShaderInputBuilder) void {
     alloc.destroy(defs orelse return);
 }
 
+pub export fn libgpu_shader_input_defs_push_float(builder: *ShaderInputBuilder, offs: u32, stride: u32) bool {
+    builder.append(.{
+        .typ = .f32,
+        .offs = offs,
+        .stride = stride,
+    }) catch return false;
+
+    return true;
+}
+
 pub export fn libgpu_shader_input_defs_push_vec3(builder: *ShaderInputBuilder, offs: u32, stride: u32) bool {
     builder.append(.{
         .typ = .vec3,
+        .offs = offs,
+        .stride = stride,
+    }) catch return false;
+
+    return true;
+}
+
+pub export fn libgpu_shader_input_defs_push_vec4(builder: *ShaderInputBuilder, offs: u32, stride: u32) bool {
+    builder.append(.{
+        .typ = .vec4,
         .offs = offs,
         .stride = stride,
     }) catch return false;
