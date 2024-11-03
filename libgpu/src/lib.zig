@@ -9,16 +9,16 @@ const global = @import("global.zig");
 // FIXME: Check signature between defined functions and headers
 //
 
-const Texture = struct {
+pub const Texture = struct {
     // 4 bytes per pix
     data: []u8,
     width_px: u32,
 
-    fn calcHeight(self: Texture) u32 {
+    pub fn calcHeight(self: Texture) u32 {
         return @intCast(self.data.len / self.calcStride());
     }
 
-    fn calcStride(self: Texture) u32 {
+    pub fn calcStride(self: Texture) u32 {
         return self.width_px * 4;
     }
 };
@@ -80,31 +80,58 @@ const Gpu = struct {
             input_handles,
             self.dumb_buffers,
             self.textures,
+            num_elems,
         );
         defer inputs.deinit(self.alloc);
 
-        const vert_outputs = try inputs.vs.executeOnBuf(self.alloc, inputs.vb, inputs.format, num_elems);
-        defer vert_outputs.deinit(self.alloc);
-
-        if (vert_outputs.marked.len < 3) {
-            return;
+        const record_path: ?[]const u8 = "graphics_inputs.json";
+        if (record_path) |p| {
+            var buf: [4096]u8 = undefined;
+            std.debug.print("Recording to {s}\n", .{std.fs.cwd().realpath(p, &buf) catch "unknown"});
+            inputs.record(p) catch |e| {
+                std.log.err("Failed to record graphics pipeline inputs: {s}", .{@errorName(e)});
+                if (@errorReturnTrace()) |t| {
+                    std.log.err("Backtrace: {any}", .{t});
+                }
+            };
         }
 
-        try rasterizeTriangles(self.alloc, vert_outputs, inputs.fs, inputs.texture);
+        try inputs.execute(self.alloc);
    }
 };
 
-const GraphicsPipelineInputs = struct {
+pub const GraphicsPipelineInputs = struct {
     vs: shader.Shader,
     fs: shader.Shader,
     vb: []const u8, // refrence to dumb_buffers data
     format: []shader.ShaderInput,
     texture: Texture, // shallow copy of textures data
+    num_elems: usize,
 
-    fn deinit(self: GraphicsPipelineInputs, alloc: Allocator) void {
+    pub fn deinit(self: GraphicsPipelineInputs, alloc: Allocator) void {
         self.vs.deinit(alloc);
         self.fs.deinit(alloc);
         alloc.free(self.format);
+    }
+
+    pub fn record(self: GraphicsPipelineInputs, p: []const u8) !void {
+        const f = try std.fs.cwd().createFile(p, .{});
+        defer f.close();
+
+        var bw = std.io.bufferedWriter(f.writer());
+        try std.json.stringify(self, .{}, bw.writer());
+        try bw.flush();
+    }
+
+    pub fn execute(inputs: GraphicsPipelineInputs, alloc: Allocator) !void {
+        const vert_outputs = try inputs.vs.executeOnBuf(alloc, inputs.vb, inputs.format, inputs.num_elems);
+        defer vert_outputs.deinit(alloc);
+
+        if (vert_outputs.marked.len < 3) {
+            return;
+        }
+
+        try rasterizeTriangles(alloc, vert_outputs, inputs.fs, inputs.texture);
     }
 };
 
@@ -116,7 +143,7 @@ const GraphicsPipelineInputHandles = struct {
     output_tex: u64,
 };
 
-fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHandles, dumb_buffers: DumbBuffers, textures: Textures) !GraphicsPipelineInputs {
+fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHandles, dumb_buffers: DumbBuffers, textures: Textures, num_elems: usize) !GraphicsPipelineInputs {
     const vs = dumb_buffers.get(handles.vs) orelse return error.InvalidVsId;
     const fs = dumb_buffers.get(handles.fs) orelse return error.InvalidFsId;
     const vb = dumb_buffers.get(handles.vb) orelse return error.InvalidVbId;
@@ -140,6 +167,7 @@ fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHand
         .vb = vb,
         .format = try alloc.dupe(shader.ShaderInput, shader_input_defs.value),
         .texture = texture,
+        .num_elems = num_elems,
     };
 }
 

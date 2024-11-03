@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
         .os_tag = .linux,
         .abi = .gnu
     });
+
     const optimize = b.standardOptimizeOption(.{});
     const lib = b.addStaticLibrary(.{
         .name = "gpu",
@@ -27,6 +28,14 @@ pub fn build(b: *std.Build) void {
     // FIXME: Split headers between libraries
     shader.bundle_compiler_rt = true;
     shader.installHeadersDirectory(b.path("src/include"), "libgpu", .{});
+
+    const replay = b.addExecutable(.{
+        .name = "replay",
+        .root_source_file = b.path("src/replay.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(replay);
 
     const tests = b.addTest(.{
         .root_source_file = b.path("src/lib.zig"),

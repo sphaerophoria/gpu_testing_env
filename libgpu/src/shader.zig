@@ -122,6 +122,7 @@ const ShaderExecutor = struct {
         defer self.alloc.free(outputs);
 
         var ssas = std.AutoHashMapUnmanaged(u32, Variable){};
+        try ssas.ensureTotalCapacity(self.alloc, @intCast(self.shader.commands.len));
         defer ssas.deinit(self.alloc);
 
         for (self.shader.commands) |command| {
