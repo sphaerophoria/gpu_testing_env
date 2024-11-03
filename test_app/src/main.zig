@@ -11,7 +11,7 @@ const c = @cImport({
     @cInclude("gbm.h");
 });
 const Allocator = std.mem.Allocator;
-const model_renderer = @import("model_renderer.zig");
+const ModelRenderer = @import("ModelRenderer.zig");
 
 // FIXME: Width and height should be selected by preferred mode
 const width = 1024;
@@ -188,6 +188,7 @@ pub fn main() !void {
         c.EGL_GREEN_SIZE, 1,
         c.EGL_BLUE_SIZE, 1,
         c.EGL_ALPHA_SIZE, 0,
+        c.EGL_DEPTH_SIZE, 1,
         c.EGL_SAMPLES, 0,
         c.EGL_NONE };
 
@@ -239,7 +240,9 @@ pub fn main() !void {
     const crtc: *c.drmModeCrtc = c.drmModeGetCrtc(f.handle, crtc_id) orelse return error.NoCrtc;
 
     var fb_id = try getFramebuffer(bo, f);
-    if (c.drmModeSetCrtc(f.handle, crtc.crtc_id, fb_id, 0, 0, &connector.connector_id, 1, preferred_mode) != 0) {
+    const crtc_ret = c.drmModeSetCrtc(f.handle, crtc.crtc_id, fb_id, 0, 0, &connector.connector_id, 1, preferred_mode);
+    if (crtc_ret != 0) {
+        std.log.err("Failed to set crtc: {d}", .{crtc_ret});
         return error.SetCrtc;
     }
 
@@ -271,18 +274,27 @@ pub fn main() !void {
 
     std.debug.print("success\n", .{});
 
+    var renderer = try ModelRenderer.init(alloc);
+
+    c.glEnable(c.GL_DEPTH_TEST);
+    c.glDepthFunc(c.GL_LESS);
+
     var color: f32 = 0.0;
     var last = try std.time.Instant.now();
     while (true) {
         const now = try std.time.Instant.now();
+        const delta: f32 = @as(f32, @floatFromInt(now.since(last))) / 1e9;
         color += @as(f32, @floatFromInt(now.since(last))) / std.time.ns_per_s;
         while (color > 1.0) {
             color -= 1.0;
         }
         c.glViewport(0, 0, width, height);
         c.glClearColor(0.0, color, 0.0, 1.0);
-        c.glClear(c.GL_COLOR_BUFFER_BIT);
-        c.glDrawArrays(c.GL_TRIANGLES, 0, 3);
+        c.glClearDepth(1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT | c.GL_DEPTH_BUFFER_BIT);
+        renderer.rotate(6 * delta, 0.0);
+        renderer.render(1.0);
+        //c.glDrawArrays(c.GL_TRIANGLES, 0, 3);
         c.glFlush();
         const next_bo = try swapBuffers(display, egl_surface, gbm_surface);
         fb_id = try getFramebuffer(next_bo, f);

@@ -1,0 +1,60 @@
+From c6440b4110d0319b707ce3e4e301ac469b2ec75e Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 4 Nov 2024 11:12:43 -0800
+Subject: [PATCH 09/11] Add ubo to graphics pipeline execution
+
+Add support for a single uniform buffer object to be passed along to the
+GPU
+---
+ drivers/gpu/drm/sphaero/sphaero_drv.c | 9 ++++++---
+ include/uapi/drm/sphaero_drm.h        | 1 +
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/sphaero/sphaero_drv.c b/drivers/gpu/drm/sphaero/sphaero_drv.c
+index d1289c8d1..587ff0f73 100644
+--- a/drivers/gpu/drm/sphaero/sphaero_drv.c
++++ b/drivers/gpu/drm/sphaero/sphaero_drv.c
+@@ -591,8 +591,9 @@ static int sphaero_gpu_exec_shader_pipeline(struct drm_device *dev, void *data,
+ 	uint64_t vs = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->vs_handle));
+ 	uint64_t fs = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->fs_handle));
+ 	uint64_t vb = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->vb_handle));
+ 	uint64_t format = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->format_handle));
++	uint64_t ubo = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->ubo_handle));
+ 	uint64_t texture = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->texture_handle));
+ 
+ 	priv->regs[1] = vs;
+ 	priv->regs[2] = vs >> 32;
+@@ -601,11 +602,13 @@ static int sphaero_gpu_exec_shader_pipeline(struct drm_device *dev, void *data,
+ 	priv->regs[5] = vb;
+ 	priv->regs[6] = vb >> 32;
+ 	priv->regs[7] = format;
+ 	priv->regs[8] = format >> 32;
+-	priv->regs[9] = texture;
+-	priv->regs[10] = texture >> 32;
+-	priv->regs[11] = params->num_inputs;
++	priv->regs[9] = ubo;
++	priv->regs[10] = ubo >> 32;
++	priv->regs[11] = texture;
++	priv->regs[12] = texture >> 32;
++	priv->regs[13] = params->num_inputs;
+ 	priv->regs[0] = SPHAERO_REG_CMD_EXEC_SHADER_PIPELINE;
+ 
+ 	return 0;
+ }
+diff --git a/include/uapi/drm/sphaero_drm.h b/include/uapi/drm/sphaero_drm.h
+index 8117c24b3..595915e80 100644
+--- a/include/uapi/drm/sphaero_drm.h
++++ b/include/uapi/drm/sphaero_drm.h
+@@ -52,8 +52,9 @@ struct drm_sphaero_exec_shader_pipeline {
+ 	// inputs
+ 	__u32 vs_handle;
+ 	__u32 fs_handle;
+ 	__u32 vb_handle;
++	__u32 ubo_handle;
+ 	__u32 format_handle;
+ 	__u32 texture_handle;
+ 	__u32 num_inputs;
+ };
+-- 
+2.44.1
+

@@ -1,0 +1,33 @@
+From 6894f1d0f06811dbcbc2873afa459d2a730fad4f Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 4 Nov 2024 11:12:51 -0800
+Subject: [PATCH 09/12] Add ubo to graphics pipeline execution
+
+---
+ hw/misc/sphaero.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index ac4d7148c..3a8615acc 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -150,12 +150,13 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+             uint64_t vs_handle = *(uint64_t*)s->args;
+             uint64_t fs_handle = *(uint64_t*)(s->args + 2);
+             uint64_t vb_handle = *(uint64_t*)(s->args + 4);
+             uint64_t vb_format_handle = *(uint64_t*)(s->args + 6);
+-            uint64_t tex_handle = *(uint64_t*)(s->args + 8);
+-            uint32_t num_elems = *(s->args + 10);
++            uint64_t ubo_handle = *(uint64_t*)(s->args + 8);
++            uint64_t tex_handle = *(uint64_t*)(s->args + 10);
++            uint32_t num_elems = *(s->args + 12);
+ 
+-            libgpu_execute_graphics_pipeline(s->gpu, vs_handle, fs_handle, vb_handle, vb_format_handle, tex_handle, num_elems);
++            libgpu_execute_graphics_pipeline(s->gpu, vs_handle, fs_handle, vb_handle, vb_format_handle, ubo_handle, tex_handle, num_elems);
+             break;
+         }
+         case SPHAERO_REG_CMD_FREE_HW_BUF: {
+             uint64_t handle = *(uint64_t*)s->args;
+-- 
+2.44.1
+

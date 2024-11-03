@@ -1,0 +1,290 @@
+From 901a680ec3cf0333bef133c9e0dc33992392bd78 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 4 Nov 2024 11:12:26 -0800
+Subject: [PATCH 7/9] 3D rendering prototype
+
+Implement whatever has to be implemented to support a simple perspective
+transform + uv mapping
+
+* Implement uniform buffer upload
+  * Set constant buffer to upload content to GPU
+  * Add ubo as input to exec pipeline call
+  * Set relevant resource limits
+* Implement relevant shader instructions
+  * Load data from UBO
+  * Implement integer add
+    * Storage format can no longer be f32, so store f32s as general "32
+      bit value"
+  * Support fmul with vec4 inputs
+  * Support fadd
+* Add support for vec2 inputs/outputs for uv coordinates
+---
+ .../winsys/sphaero/drm/sphaero_drm_winsys.c   | 120 +++++++++++++++---
+ 1 file changed, 105 insertions(+), 15 deletions(-)
+
+diff --git a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+index 58d77ea..b7482ee 100644
+--- a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
++++ b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+@@ -19,8 +19,13 @@ struct sphaero_resource {
+    struct pipe_resource pr;
+    uint32_t handle;
+ };
+ 
++struct sphaero_ubo {
++   uint32_t handle;
++   uint32_t size;
++};
++
+ struct sphaero_shader_state {
+    uint32_t handle;
+ };
+ 
+@@ -31,8 +36,9 @@ struct sphaero_context {
+    unsigned num_vertex_elements;
+    struct pipe_vertex_buffer vertex_buffer;
+    struct sphaero_shader_state vs;
+    struct sphaero_shader_state fs;
++   struct sphaero_ubo gpu_ubos[PIPE_MAX_CONSTANT_BUFFERS];
+ };
+ 
+ struct sphaero_screen {
+    struct pipe_screen ps;
+@@ -82,9 +88,9 @@ sphaero_drm_get_shader_param(struct pipe_screen *screen,
+           switch (param) {
+             case PIPE_SHADER_CAP_MAX_INPUTS: {
+                return 2;
+             }
+-
++            case PIPE_SHADER_CAP_MAX_CONST_BUFFER0_SIZE: return 128;
+             default: break;
+           }
+           break;
+       }
+@@ -156,9 +162,42 @@ static void *sphaero_compile_shader(int fd, struct libgpu_shader* libgpu_shader,
+                            alu->def.index,
+                            alu->src[0].src.ssa->index);
+                      break;
+                   case nir_op_fmul:
+-                     libgpu_shader_push_command_fmul(
++                     switch (alu->def.num_components) {
++                        case 1:
++                           libgpu_shader_push_command_fmul(
++                                 libgpu_shader,
++                                 alu->def.index,
++                                 alu->src[0].src.ssa->index,
++                                 alu->src[1].src.ssa->index);
++                           break;
++                        case 4:
++                           for (int i = 0; i < 4; ++i){
++                              assert(alu->src[0].swizzle[i] == i);
++                           }
++
++                           libgpu_shader_push_command_fmul_by_v4_swizzle(
++                                 libgpu_shader,
++                                 alu->def.index,
++                                 alu->src[0].src.ssa->index,
++                                 alu->src[1].src.ssa->index, alu->src[1].swizzle[0],
++                                 alu->src[1].src.ssa->index, alu->src[1].swizzle[0],
++                                 alu->src[1].src.ssa->index, alu->src[1].swizzle[0],
++                                 alu->src[1].src.ssa->index, alu->src[1].swizzle[0]);
++                           break;
++                        default: assert(!"Unhandled fmul size");
++                     }
++                     break;
++                  case nir_op_iadd:
++                     libgpu_shader_push_command_iadd(
++                           libgpu_shader,
++                           alu->def.index,
++                           alu->src[0].src.ssa->index,
++                           alu->src[1].src.ssa->index);
++                     break;
++                  case nir_op_fadd:
++                     libgpu_shader_push_command_fadd(
+                            libgpu_shader,
+                            alu->def.index,
+                            alu->src[0].src.ssa->index,
+                            alu->src[1].src.ssa->index);
+@@ -183,14 +222,21 @@ static void *sphaero_compile_shader(int fd, struct libgpu_shader* libgpu_shader,
+                break;
+             }
+             case nir_instr_type_intrinsic: {
+                nir_intrinsic_instr *intrinsic = nir_instr_as_intrinsic(instr);
+-               assert(intrinsic->intrinsic == nir_intrinsic_load_deref || intrinsic->intrinsic == nir_intrinsic_store_deref);
+-               if (intrinsic->intrinsic == nir_intrinsic_load_deref) {
+-                  libgpu_shader_push_command_load(libgpu_shader, intrinsic->src[0].ssa->index, intrinsic->def.index);
+-               }
+-               else if (intrinsic->intrinsic == nir_intrinsic_store_deref) {
+-                  libgpu_shader_push_command_store(libgpu_shader, intrinsic->src[1].ssa->index, intrinsic->src[0].ssa->index);
++               switch (intrinsic->intrinsic) {
++                  case nir_intrinsic_load_deref:
++                     libgpu_shader_push_command_load(libgpu_shader, intrinsic->src[0].ssa->index, intrinsic->def.index);
++                     break;
++                  case nir_intrinsic_store_deref:
++                     libgpu_shader_push_command_store(libgpu_shader, intrinsic->src[1].ssa->index, intrinsic->src[0].ssa->index);
++                     break;
++                  case nir_intrinsic_load_ubo_vec4:
++                     libgpu_shader_push_command_load_ubo_vec4(libgpu_shader, intrinsic->def.index, intrinsic->src[0].ssa->index, intrinsic->src[1].ssa->index);
++                     break;
++                  default:
++                     assert(!"Unhandled intrinsic type");
++                     break;
+                }
+                break;
+             }
+             case nir_instr_type_load_const: {
+@@ -198,9 +244,16 @@ static void *sphaero_compile_shader(int fd, struct libgpu_shader* libgpu_shader,
+ 
+                assert(load_const->def.bit_size == 32);
+                switch (load_const->def.num_components) {
+                   case 1:
+-                     libgpu_shader_push_command_load_constant_f32(libgpu_shader, load_const->def.index, load_const->value[0].f32);
++                     libgpu_shader_push_command_load_constant_32(libgpu_shader, load_const->def.index, load_const->value[0].u32);
++                     break;
++                  case 2:
++                     libgpu_shader_push_command_load_constant_vec2(
++                           libgpu_shader,
++                           load_const->def.index,
++                           load_const->value[0].f32,
++                           load_const->value[1].f32);
+                      break;
+                   case 4:
+                      libgpu_shader_push_command_load_constant_vec4(
+                            libgpu_shader,
+@@ -245,9 +298,10 @@ static void *sphaero_compile_shader(int fd, struct libgpu_shader* libgpu_shader,
+ static void sphaero_push_inputs_outputs(struct nir_shader* in, struct libgpu_shader* out) {
+    nir_foreach_variable_with_modes(var, in, nir_var_shader_in) {
+       assert(var->type->base_type == GLSL_TYPE_FLOAT);
+       switch (var->type->vector_elements) {
+-         case 1: libgpu_shader_push_input_float(out); break;
++         case 1: libgpu_shader_push_input_32(out); break;
++         case 2: libgpu_shader_push_input_vec2(out); break;
+          case 3: libgpu_shader_push_input_vec3(out); break;
+          case 4: libgpu_shader_push_input_vec4(out); break;
+          default: assert(!"Unhandled number of output vector elements");
+       }
+@@ -261,9 +315,10 @@ static void sphaero_push_inputs_outputs(struct nir_shader* in, struct libgpu_sha
+          continue;
+       }
+ 
+       switch (var->type->vector_elements) {
+-         case 1: libgpu_shader_push_output_float(out); break;
++         case 1: libgpu_shader_push_output_32(out); break;
++         case 2: libgpu_shader_push_output_vec2(out); break;
+          case 3: libgpu_shader_push_output_vec3(out); break;
+          case 4: libgpu_shader_push_output_vec4(out); break;
+          default: assert(!"Unhandled number of output vector elements");
+       }
+@@ -278,8 +333,10 @@ static void *sphaero_ctx_create_shader_state(struct pipe_context *ctx,
+    struct libgpu_shader *libgpu_shader = libgpu_create_shader();
+    assert(templ->type == PIPE_SHADER_IR_NIR);
+    struct nir_shader* shader = templ->ir.nir;
+ 
++   NIR_PASS_V(shader, nir_remove_dead_derefs);
++
+    sphaero_push_inputs_outputs(shader, libgpu_shader);
+    return sphaero_compile_shader(screen->fd, libgpu_shader, shader);
+ }
+ 
+@@ -289,9 +346,9 @@ static bool sphaero_drm_is_format_supported(struct pipe_screen *screen,
+                             unsigned sample_count,
+                             unsigned storage_sample_count,
+                             unsigned bindings) {
+ 
+-   if (format != PIPE_FORMAT_BGRA8888_UNORM && format != PIPE_FORMAT_BGRX8888_UNORM) {
++   if (format != PIPE_FORMAT_BGRA8888_UNORM && format != PIPE_FORMAT_BGRX8888_UNORM && format != PIPE_FORMAT_Z32_UNORM) {
+       return false;
+    }
+    if (sample_count < 2 && storage_sample_count < 2) {
+       return true;
+@@ -480,10 +537,13 @@ static int sphaero_make_gpu_elems(struct sphaero_context *ctx, struct sphaero_sc
+             break;
+          case PIPE_FORMAT_R32G32B32_FLOAT:
+             libgpu_shader_input_defs_push_vec3(input_defs, ctx->vertex_elements[i].src_offset, ctx->vertex_elements[i].src_stride);
+             break;
++         case PIPE_FORMAT_R32G32_FLOAT:
++            libgpu_shader_input_defs_push_vec2(input_defs, ctx->vertex_elements[i].src_offset, ctx->vertex_elements[i].src_stride);
++            break;
+          case PIPE_FORMAT_R32_FLOAT:
+-            libgpu_shader_input_defs_push_float(input_defs, ctx->vertex_elements[i].src_offset, ctx->vertex_elements[i].src_stride);
++            libgpu_shader_input_defs_push_32(input_defs, ctx->vertex_elements[i].src_offset, ctx->vertex_elements[i].src_stride);
+             break;
+          default:
+             assert(!"Unhandled vertex attribute format");
+             break;
+@@ -529,8 +589,10 @@ static void sphaero_ctx_draw_vbo(struct pipe_context *pipe,
+    struct drm_sphaero_exec_shader_pipeline exec_req = {
+ 	.vs_handle = ctx->vs.handle,
+ 	.fs_handle = ctx->fs.handle,
+ 	.vb_handle = res->handle,
++        // FIXME: Multiple ubos
++        .ubo_handle = ctx->gpu_ubos[0].handle,
+ 	.format_handle = input_defs_handle,
+ 	.texture_handle = ctx->bound_texture->handle,
+ 	.num_inputs = draws[0].count
+    };
+@@ -541,11 +603,40 @@ static void sphaero_ctx_draw_vbo(struct pipe_context *pipe,
+ 
+    drmCloseBufferHandle(screen->fd, input_defs_handle);
+ }
+ 
++static void sphaero_set_constant_buffer(struct pipe_context * pc,
++                            enum pipe_shader_type shader, uint index,
++                            bool take_ownership,
++                            const struct pipe_constant_buffer *buf) {
++   struct sphaero_screen* screen = (struct sphaero_screen*)pc->screen;
++   struct sphaero_context* ctx = (struct sphaero_context*)pc;
++   if (buf->buffer == NULL) {
++      // FIXME: Better code would #define INVALID_HANDLE -> UINT32_MAX
++      if (ctx->gpu_ubos[index].handle != UINT32_MAX) {
++         drmCloseBufferHandle(screen->fd, ctx->gpu_ubos[index].handle);
++         ctx->gpu_ubos[index].handle = UINT32_MAX;
++      }
++
++      if (sphaero_alloc_gpu_obj(screen->fd, buf->buffer_size, &ctx->gpu_ubos[index].handle)) {
++         fprintf(stderr, "Failed to alloc constant buf obj\n");
++         return;
++      }
++
++      // Maybe we need to preserve the previous data or something
++      assert(buf->buffer_offset == 0);
++      sphaero_copy_to_gpu(screen->fd, ctx->gpu_ubos[index].handle, buf->user_buffer, buf->buffer_size);
++   } else {
++      assert(!"Unimplemented set constant buffer for existing pipe resource");
++   }
++}
++
+ static struct pipe_context* sphaero_context_create(struct pipe_screen *screen,
+                                         void *priv, unsigned flags) {
+    struct sphaero_context* ctx = CALLOC_STRUCT(sphaero_context);
++   for (int i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; ++i) {
++      ctx->gpu_ubos[i].handle = UINT32_MAX;
++   }
+    ctx->pc.screen = screen;
+    ctx->pc.create_surface = sphaero_ctx_create_surface;
+    ctx->pc.surface_destroy = sphaero_ctx_surface_destroy;
+    ctx->pc.set_framebuffer_state = sphaero_ctx_set_framebuffer_state;
+@@ -569,8 +660,9 @@ static struct pipe_context* sphaero_context_create(struct pipe_screen *screen,
+    ctx->pc.create_vertex_elements_state = sphaero_ctx_create_vertex_elements_state;
+    ctx->pc.bind_vertex_elements_state = sphaero_ctx_bind_vertex_elements_state;
+    ctx->pc.set_vertex_buffers = sphaero_ctx_set_vertex_buffers;
+    ctx->pc.draw_vbo = sphaero_ctx_draw_vbo;
++   ctx->pc.set_constant_buffer = sphaero_set_constant_buffer;
+    return &ctx->pc;
+ }
+ 
+ static struct pipe_resource* sphaero_drm_resource_create(struct pipe_screen *ps,
+@@ -585,10 +677,8 @@ static struct pipe_resource* sphaero_drm_resource_create(struct pipe_screen *ps,
+       if (sphaero_alloc_gpu_obj(screen->fd, templat->width0, &ret->handle)) {
+          fprintf(stderr, "alloc gpu obj failed\n");
+          return NULL;
+       }
+-
+-      return &ret->pr;
+    } else {
+       struct drm_sphaero_create_gl_tex create_req = {
+          .width = ret->pr.width0,
+          .height = ret->pr.height0,
+-- 
+2.44.1
+

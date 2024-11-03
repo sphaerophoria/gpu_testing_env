@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const global = @import("global.zig");
 const lin = @import("lin.zig");
+const Vec2 = lin.Vec2;
 const Vec3 = lin.Vec3;
 const Vec4 = lin.Vec4;
 
@@ -19,29 +20,71 @@ const Reference = struct {
 const ChannelReference = struct {
     source: ReferenceType,
     index: u32,
-    sub_index: u8,
+    sub_index: u32,
 };
 
 const VariableType = enum {
+    vec2,
     vec3,
     vec4,
-    f32,
+    u32,
     reference,
+    channel_reference,
     unassigned,
 };
 
 pub const Variable = union(VariableType) {
+    vec2: Vec2,
     vec3: Vec3,
     vec4: Vec4,
-    f32: f32,
+    // FIXME: This should just store that it's 4 bytes, and cast when necessary
+    u32: u32,
     reference: Reference,
+    channel_reference: ChannelReference,
     unassigned,
+
+
+    pub fn asi32(self: Variable) !i32 {
+        return self.as32(i32);
+    }
+
+    pub fn asu32(self: Variable) !u32 {
+        return self.as32(u32);
+    }
+
+    pub fn asf32(self: Variable) !f32 {
+        return self.as32(f32);
+    }
+
+    pub fn asvec2(self: Variable) !Vec2 {
+        if (self != .vec2) {
+            return error.InvalidType;
+        }
+        return self.vec2;
+    }
+
+    fn as32(self: Variable, comptime T: type) !T {
+        if (self != .u32) {
+            return error.InvalidType;
+        }
+
+        return @bitCast(self.u32);
+    }
 };
 
 const Command = union(enum) {
     load_reference: struct {
         id: u32,
         reference: Reference,
+    },
+    load_channel_ref: struct {
+        id: u32,
+        reference: ChannelReference,
+    },
+    load_ubo_vec4: struct {
+        id: u32,
+        a: u32, // Likely which ubo
+        b: u32, // Likely offset within ubo
     },
     load_constant: struct {
         id: u32,
@@ -64,8 +107,23 @@ const Command = union(enum) {
         b: u32,
         output: u32,
     },
+    fmul_by_v4_swizzle: struct {
+        a: u32,
+        b: [4]ChannelReference,
+        output: u32,
+    },
     fsin: struct {
         input: u32,
+        output: u32,
+    },
+    fadd: struct {
+        a: u32,
+        b: u32,
+        output: u32,
+    },
+    iadd: struct {
+        a: u32,
+        b: u32,
         output: u32,
     },
 };
@@ -97,7 +155,7 @@ const ShaderExecutor = struct {
     alloc: Allocator,
     shader: Shader,
 
-    pub fn executeOnBuf(self: ShaderExecutor, input_data: []const u8, input_defs: []const ShaderInput, num_indices: usize) !ShaderOutput {
+    pub fn executeOnBuf(self: ShaderExecutor, input_data: []const u8, input_defs: []const ShaderInput, ubo: []const u8, num_indices: usize) !ShaderOutput {
         const marked_outputs = try self.alloc.alloc(Variable, num_indices);
         const unmarked_outputs = try self.alloc.alloc(?Variable, num_indices);
 
@@ -105,7 +163,7 @@ const ShaderExecutor = struct {
             const input_group = try extractInputsFromBuf(self.alloc, group_idx, input_data, input_defs);
             defer self.alloc.free(input_group);
 
-            const one_ret =  try self.executeOnInputs(input_group);
+            const one_ret =  try self.executeOnInputs(input_group, ubo);
 
             marked_outputs[group_idx] = one_ret.marked;
             unmarked_outputs[group_idx] = one_ret.unmarked;
@@ -117,7 +175,7 @@ const ShaderExecutor = struct {
     }
 
     // inputs may be modified
-    pub fn executeOnInputs(self: ShaderExecutor, inputs: []Variable) !SingleShaderOutput {
+    pub fn executeOnInputs(self: ShaderExecutor, inputs: []Variable, ubo: []const u8) !SingleShaderOutput {
         const outputs = try makeShaderOutputs(self.alloc, self.shader.output_types);
         defer self.alloc.free(outputs);
 
@@ -132,6 +190,9 @@ const ShaderExecutor = struct {
                 },
                 .load_constant => |l| {
                     try ssas.put(self.alloc, l.id, l.val);
+                },
+                .load_channel_ref => |l| {
+                    try ssas.put(self.alloc, l.id, .{ .channel_reference = l.reference });
                 },
                 .load => |d| {
                     const input = ssas.get(d.input) orelse return error.InvalidReference;
@@ -153,12 +214,64 @@ const ShaderExecutor = struct {
                 },
                 .fsin => |f| {
                     const input = ssas.get(f.input) orelse return error.InvalidReference;
-                    try ssas.put(self.alloc, f.output , .{ .f32 = @sin(input.f32) });
+                    const output: f32 = @sin(try input.asf32());
+                    try ssas.put(self.alloc, f.output , .{ .u32 = @bitCast(output) });
                 },
                 .fmul => |f| {
                     const a = ssas.get(f.a) orelse return error.InvalidReference;
                     const b = ssas.get(f.b) orelse return error.InvalidReference;
-                    try ssas.put(self.alloc, f.output , .{ .f32 = a.f32 * b.f32 });
+                    const output = try a.asf32() * try b.asf32();
+                    try ssas.put(self.alloc, f.output , .{ .u32 = @bitCast(output)});
+                },
+                .fmul_by_v4_swizzle => |f| {
+                    const a_var = ssas.get(f.a) orelse return error.InvalidReference;
+                    if (a_var != .vec4) {
+                        return error.InvalidType;
+                    }
+                    const a = a_var.vec4;
+                    const b = Vec4{
+                        try resolveChannelRef(f.b[0], inputs, outputs, ssas),
+                        try resolveChannelRef(f.b[1], inputs, outputs, ssas),
+                        try resolveChannelRef(f.b[2], inputs, outputs, ssas),
+                        try resolveChannelRef(f.b[3], inputs, outputs, ssas),
+                    };
+
+                    try ssas.put(self.alloc, f.output, .{ .vec4 = a * b });
+                },
+                .iadd => |instr| {
+                    const a = ssas.get(instr.a) orelse return error.InvalidReference;
+                    const b = ssas.get(instr.b) orelse return error.InvalidReference;
+                    const output = try a.asi32() + try b.asi32();
+                    try ssas.put(self.alloc, instr.output , .{ .u32 = @bitCast(output)});
+                },
+                .load_ubo_vec4 => |lub| {
+                    const a = ssas.get(lub.a) orelse return error.InvalidReference;
+                    const b = ssas.get(lub.b) orelse return error.InvalidReference;
+                    std.debug.assert(try a.asu32() == 0); // Only have one ubo :)
+
+                    const v4_size = 16;
+                    const start = try b.asu32() * v4_size;
+                    const end = start + v4_size;
+
+                    const out = std.mem.bytesToValue(Vec4, ubo[start..end]);
+                    try ssas.put(self.alloc, lub.id, .{ .vec4 = out });
+                },
+                .fadd => |f| {
+                    const a = ssas.get(f.a) orelse return error.InvalidReference;
+                    const b = ssas.get(f.b) orelse return error.InvalidReference;
+
+                    switch (a) {
+                        .vec4 => |v| {
+                            if (b != .vec4) {
+                                return error.InvalidAdd;
+                            }
+                            try ssas.put(self.alloc, f.output, .{ .vec4 = v + b.vec4 });
+                        },
+                        else => {
+                            std.log.err("Unimplemented fadd for type: {s}", .{@tagName(a)});
+                            @panic("Unimplemented");
+                        },
+                    }
                 },
             }
         }
@@ -187,11 +300,12 @@ const ShaderExecutor = struct {
         };
 
         switch (val) {
+            .vec2 => |v| return v[ref.sub_index],
             .vec3 => |v| return v[ref.sub_index],
             .vec4 => |v| return v[ref.sub_index],
-            .f32 => |f| {
+            .u32 => |v| {
                 std.debug.assert(ref.sub_index == 0);
-                return f;
+                return @bitCast(v);
             },
             else => {
                 std.log.err("unhandled ref type {any}", .{val});
@@ -216,10 +330,16 @@ fn extractInputsFromBuf(alloc: Allocator, group_idx: usize, input_data: []const 
     for (input_defs, 0..) |def, input_idx| {
         const input_start = def.offs + def.stride * group_idx;
         inputs[input_idx] = switch(def.typ) {
-            .f32 => blk: {
-                const input_end = input_start + @sizeOf(f32);
+            .u32 => blk: {
+                const input_end = input_start + @sizeOf(u32);
                 break :blk .{
-                    .f32 = std.mem.bytesToValue(f32, input_data[input_start..input_end])
+                    .u32 = std.mem.bytesToValue(u32, input_data[input_start..input_end])
+                };
+            },
+            .vec2 => blk: {
+                const input_end = input_start + @sizeOf(Vec2);
+                break :blk .{
+                    .vec2 = std.mem.bytesToValue(Vec2, input_data[input_start..input_end])
                 };
             },
             .vec3 => blk: {
@@ -271,22 +391,22 @@ pub const Shader = struct {
         alloc.free(self.output_types);
     }
 
-    pub fn executeOnBuf(self: Shader, alloc: Allocator, vertex_buf: []const u8, format: []ShaderInput, num_elems: usize) !ShaderOutput {
+    pub fn executeOnBuf(self: Shader, alloc: Allocator, vertex_buf: []const u8, format: []ShaderInput, ubo: []const u8, num_elems: usize) !ShaderOutput {
         const executor = ShaderExecutor {
             .alloc = alloc,
             .shader = self,
         };
 
-        return try executor.executeOnBuf(vertex_buf, format, num_elems);
+        return try executor.executeOnBuf(vertex_buf, format, ubo, num_elems);
     }
 
-    pub fn executeOnInputs(self: Shader, alloc: Allocator, inputs: []Variable) !SingleShaderOutput {
+    pub fn executeOnInputs(self: Shader, alloc: Allocator, inputs: []Variable, ubo: []const u8) !SingleShaderOutput {
         const executor = ShaderExecutor {
             .alloc = alloc,
             .shader = self,
         };
 
-        return try executor.executeOnInputs(inputs);
+        return try executor.executeOnInputs(inputs, ubo);
     }
 };
 

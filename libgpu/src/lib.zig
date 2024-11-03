@@ -74,7 +74,7 @@ const Gpu = struct {
         }
     }
 
-    pub fn executeGraphicsPipeline(self: *Gpu, input_handles: GraphicsPipelineInputHandles, num_elems: usize) !void {
+    pub fn executeGraphicsPipeline(self: *Gpu, alloc: Allocator, input_handles: GraphicsPipelineInputHandles, num_elems: usize) !void {
         const inputs = try getGraphicsPiplineInputs(
             self.alloc,
             input_handles,
@@ -84,7 +84,7 @@ const Gpu = struct {
         );
         defer inputs.deinit(self.alloc);
 
-        const record_path: ?[]const u8 = "graphics_inputs.json";
+        const record_path: ?[]const u8 = null;
         if (record_path) |p| {
             var buf: [4096]u8 = undefined;
             std.debug.print("Recording to {s}\n", .{std.fs.cwd().realpath(p, &buf) catch "unknown"});
@@ -94,9 +94,10 @@ const Gpu = struct {
                     std.log.err("Backtrace: {any}", .{t});
                 }
             };
+        } else {
+            try inputs.execute(alloc);
         }
 
-        try inputs.execute(self.alloc);
    }
 };
 
@@ -105,6 +106,7 @@ pub const GraphicsPipelineInputs = struct {
     fs: shader.Shader,
     vb: []const u8, // refrence to dumb_buffers data
     format: []shader.ShaderInput,
+    ubo: []const u8, // reference to dumb_buffers data
     texture: Texture, // shallow copy of textures data
     num_elems: usize,
 
@@ -124,7 +126,7 @@ pub const GraphicsPipelineInputs = struct {
     }
 
     pub fn execute(inputs: GraphicsPipelineInputs, alloc: Allocator) !void {
-        const vert_outputs = try inputs.vs.executeOnBuf(alloc, inputs.vb, inputs.format, inputs.num_elems);
+        const vert_outputs = try inputs.vs.executeOnBuf(alloc, inputs.vb, inputs.format, inputs.ubo, inputs.num_elems);
         defer vert_outputs.deinit(alloc);
 
         if (vert_outputs.marked.len < 3) {
@@ -139,6 +141,7 @@ const GraphicsPipelineInputHandles = struct {
     vs: u64,
     fs: u64,
     vb: u64,
+    ubo: u64,
     format: u64,
     output_tex: u64,
 };
@@ -147,6 +150,7 @@ fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHand
     const vs = dumb_buffers.get(handles.vs) orelse return error.InvalidVsId;
     const fs = dumb_buffers.get(handles.fs) orelse return error.InvalidFsId;
     const vb = dumb_buffers.get(handles.vb) orelse return error.InvalidVbId;
+    const ubo = dumb_buffers.get(handles.ubo) orelse return error.InvalidUboId;
     const format = dumb_buffers.get(handles.format) orelse return error.InvalidFormatId;
     const texture = textures.get(handles.output_tex) orelse return error.InvalidTextureId;
 
@@ -165,6 +169,7 @@ fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHand
         .vs = vert_shader,
         .fs = fragment_shader,
         .vb = vb,
+        .ubo = ubo,
         .format = try alloc.dupe(shader.ShaderInput, shader_input_defs.value),
         .texture = texture,
         .num_elems = num_elems,
@@ -203,8 +208,6 @@ const TriangleRasterizer = struct {
         const start_y: usize = clampCastF32U32(start.y, 0, self.texture_height_px);
         const end_y: usize  = clampCastF32U32(end.y, 0, self.texture_height_px);
 
-        std.debug.print("start y: {d}, end y: {d}", .{start_y, end_y});
-
         const total_area = lin.cross(
             sorted_triangle[1].vec2() - sorted_triangle[0].vec2(),
             sorted_triangle[2].vec2() - sorted_triangle[0].vec2(),
@@ -227,7 +230,7 @@ const TriangleRasterizer = struct {
                 const frag_input = try interpolateVars(frag_inputs, bary_a, bary_b, bary_c);
 
                 var frag_inputs_mut = [1]shader.Variable{frag_input};
-                const frag_output = try self.frag_shader.executeOnInputs(self.alloc, &frag_inputs_mut);
+                const frag_output = try self.frag_shader.executeOnInputs(self.alloc, &frag_inputs_mut, &.{});
                 const color = vec4ColorToU32(frag_output.marked.vec4);
                 self.texture_data_u32[y_px * self.texture_width_px + x_px] = color;
             }
@@ -290,10 +293,18 @@ fn interpolateVars(v: [3]shader.Variable, a: f32, b: f32, c: f32) !shader.Variab
     }
 
     switch(v[0]) {
-        .f32 => {
+        .u32 => {
+            const out = a * try v[0].asf32() + b * try v[1].asf32() + c * try v[2].asf32();
             return .{
-                .f32 = a * v[0].f32 + b * v[1].f32 + c * v[2].f32,
+                .u32 = @bitCast(out),
             };
+        },
+        .vec2 => {
+            const out = lin.Vec2{a, a} * try v[0].asvec2() + lin.Vec2{b, b} * try v[1].asvec2() + lin.Vec2{c, c} * try v[2].asvec2();
+            return .{
+                .vec2 = out,
+            };
+
         },
         else => {
             return error.UnhandledInterpolation;
@@ -301,8 +312,12 @@ fn interpolateVars(v: [3]shader.Variable, a: f32, b: f32, c: f32) !shader.Variab
     }
 }
 
-pub fn homogenousToPixelCoord(coord: Vec4, width: u32, height: u32) PixelCoord {
+pub fn homogenousToPixelCoord(coord: Vec4, width: u32, height: u32) ?PixelCoord {
     const height_f: f32 = @floatFromInt(height);
+    if (coord[3] == 0) {
+        return null;
+    }
+
     const x_norm = coord[0] / coord[3];
     const y_norm = coord[1] / coord[3];
     const w_norm = coord[3];
@@ -313,11 +328,11 @@ pub fn homogenousToPixelCoord(coord: Vec4, width: u32, height: u32) PixelCoord {
     };
 }
 
-fn homogeneousToPixelCoords(homogenous_coords: [3]Vec4, texture_width_px: u32, texture_height_px: u32) [3]PixelCoord {
+fn homogeneousToPixelCoords(homogenous_coords: [3]Vec4, texture_width_px: u32, texture_height_px: u32) ?[3]PixelCoord {
     var coords: [3]PixelCoord = undefined;
 
     for (homogenous_coords, 0..) |homogenous_coord, i| {
-        coords[i] = homogenousToPixelCoord(homogenous_coord, texture_width_px, texture_height_px);
+        coords[i] = homogenousToPixelCoord(homogenous_coord, texture_width_px, texture_height_px) orelse return null;
     }
     return coords;
 }
@@ -380,7 +395,7 @@ fn rasterizeTriangles(alloc: Allocator, vert_outputs: shader.ShaderOutput, frag_
             coords,
             rasterizer.texture_width_px,
             rasterizer.texture_height_px,
-        );
+        ) orelse continue;
 
         const sorted_indices = sortCoordsByPixelY(pixel_coords);
 
@@ -476,11 +491,19 @@ pub export fn libgpu_gpu_get_dumb(gpu: *Gpu, id: u64, data: ?**anyopaque) bool {
     return true;
 }
 
-pub export fn libgpu_execute_graphics_pipeline(gpu: *Gpu, vs: u64, fs: u64, vb: u64, format: u64, output_tex: u64, num_elems: usize) bool {
-    gpu.executeGraphicsPipeline(.{
+pub export fn libgpu_execute_graphics_pipeline(gpu: *Gpu, vs: u64, fs: u64, vb: u64, format: u64, ubo: u64, output_tex: u64, num_elems: usize) bool {
+    var arena = std.heap.ArenaAllocator.init(gpu.alloc);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    _ = alloc.alloc(u8, 1 * 1024 * 1024) catch return false;
+    _ = arena.reset(.retain_capacity);
+
+    gpu.executeGraphicsPipeline(alloc, .{
         .vs = vs,
         .fs = fs,
         .vb = vb,
+        .ubo = ubo,
         .format = format,
         .output_tex = output_tex,
     }, num_elems) catch |e| {

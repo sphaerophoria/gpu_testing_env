@@ -49,9 +49,9 @@ pub fn main() !void {
     for (0..image_height) |y| {
         for (0..parsed.value.texture.width_px) |x| {
             const start = y * image_stride + x * 4;
-            const end = start + 3;
-            const s = parsed.value.texture.data[start..end];
-            try output_writer.writeAll(s);
+            try output_writer.writeByte(parsed.value.texture.data[start + 2]);
+            try output_writer.writeByte(parsed.value.texture.data[start + 1]);
+            try output_writer.writeByte(parsed.value.texture.data[start + 0]);
         }
     }
 }
