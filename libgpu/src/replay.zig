@@ -20,6 +20,7 @@ pub fn main() !void {
 
     const recording_path = args[1];
     const output_path = args[2];
+    const depth_output_path = args[3];
 
     const f = try std.fs.cwd().openFile(recording_path, .{});
     defer f.close();
@@ -52,6 +53,27 @@ pub fn main() !void {
             try output_writer.writeByte(parsed.value.texture.data[start + 2]);
             try output_writer.writeByte(parsed.value.texture.data[start + 1]);
             try output_writer.writeByte(parsed.value.texture.data[start + 0]);
+        }
+    }
+
+    const depth_output_f = try std.fs.cwd().createFile(depth_output_path, .{});
+    defer depth_output_f.close();
+
+    var depth_bw = std.io.bufferedWriter(depth_output_f.writer());
+    defer depth_bw.flush() catch {};
+
+    const depth_output_writer = depth_bw.writer();
+    try depth_output_writer.print("P6\n{d} {d}\n255\n", .{parsed.value.depth_texture.width_px, image_height});
+    for (0..image_height) |y| {
+        for (0..parsed.value.depth_texture.width_px) |x| {
+            const start = y * image_stride + x * 4;
+            const end = start + 4;
+            const val = std.mem.bytesToValue(u32, parsed.value.depth_texture.data[start..end]);
+            const val_u8: u8 =  @truncate(val >> 26);
+
+            try depth_output_writer.writeByte(val_u8);
+            try depth_output_writer.writeByte(val_u8);
+            try depth_output_writer.writeByte(val_u8);
         }
     }
 }

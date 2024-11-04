@@ -1,0 +1,56 @@
+From 607fb21f79d462378edef0e0d2f556ef308428ab Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 4 Nov 2024 23:19:06 +0000
+Subject: [PATCH 10/12] Depth testing support
+
+Propagate depth buffer to gpu on clear/pipeline execution
+---
+ hw/misc/sphaero.c | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index 3a8615acc..5fe9c0b61 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -73,14 +73,17 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+         case SPHAERO_REG_CMD_GL_CLEAR: {
+             assert(sphaero_is_little_endian());
+             uint64_t* handle = (uint64_t*)s->args;
+             float* color_buf = (float*)(s->args + 2);
+-            uint32_t minx = *(s->args + 6);
+-            uint32_t maxx = *(s->args + 7);
+-            uint32_t miny = *(s->args + 8);
+-            uint32_t maxy = *(s->args + 9);
+-
+-            libgpu_gpu_clear(s->gpu, *handle, color_buf, minx, maxx, miny, maxy);
++            uint64_t* depth_handle = (uint64_t*)(s->args + 6);
++            uint32_t depth_val = *(s->args + 8);
++            uint32_t minx = *(s->args + 9);
++            uint32_t maxx = *(s->args + 10);
++            uint32_t miny = *(s->args + 11);
++            uint32_t maxy = *(s->args + 12);
++
++            libgpu_gpu_clear_color(s->gpu, *handle, color_buf, minx, maxx, miny, maxy);
++            libgpu_gpu_clear_depth(s->gpu, *depth_handle, depth_val, minx, maxx, miny, maxy);
+             break;
+        }
+         case SPHAERO_REG_CMD_SET_HW_FB: {
+             assert(sphaero_is_little_endian());
+@@ -152,11 +155,12 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+             uint64_t vb_handle = *(uint64_t*)(s->args + 4);
+             uint64_t vb_format_handle = *(uint64_t*)(s->args + 6);
+             uint64_t ubo_handle = *(uint64_t*)(s->args + 8);
+             uint64_t tex_handle = *(uint64_t*)(s->args + 10);
+-            uint32_t num_elems = *(s->args + 12);
++            uint64_t depth_tex_handle = *(uint64_t*)(s->args + 12);
++            uint32_t num_elems = *(s->args + 14);
+ 
+-            libgpu_execute_graphics_pipeline(s->gpu, vs_handle, fs_handle, vb_handle, vb_format_handle, ubo_handle, tex_handle, num_elems);
++            libgpu_execute_graphics_pipeline(s->gpu, vs_handle, fs_handle, vb_handle, vb_format_handle, ubo_handle, tex_handle, depth_tex_handle, num_elems);
+             break;
+         }
+         case SPHAERO_REG_CMD_FREE_HW_BUF: {
+             uint64_t handle = *(uint64_t*)s->args;
+-- 
+2.44.1
+

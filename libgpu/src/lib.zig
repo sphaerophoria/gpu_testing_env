@@ -57,19 +57,28 @@ const Gpu = struct {
         self.alloc.free(kv.value);
     }
 
-    pub fn clear(self: *Gpu, id: u64, rgba_opt: [*c]f32, minx: u32, maxx: u32, miny: u32, maxy: u32) !void {
+    pub fn clear_color(self: *Gpu, id: u64, rgba_opt: [*c]f32, minx: u32, maxx: u32, miny: u32, maxy: u32) !void {
         const rgba = rgba_opt orelse return error.NoRgba;
+        var color: u32 = 0;
+        for (0..4) |c| {
+            const channel: u32 = @intFromFloat(rgba[c] * 255.0);
+            color |= channel << @intCast(c * 8);
+        }
+
+        try self.clear_u32(id, color, minx, maxx, miny, maxy);
+    }
+
+    pub fn clear_u32(self: *Gpu, id: u64, color: u32, minx: u32, maxx: u32, miny: u32, maxy: u32) !void {
         const texture = self.textures.get(id) orelse return error.InvalidTextureId;
+        std.debug.print("Clearing {d} with val 0x{x}\n",.{id, color});
 
         const adjusted_maxx = if (maxx == 0) texture.width_px else maxx;
         const adjusted_maxy = if (maxy == 0) texture.calcHeight() else maxy;
-        const stride = texture.calcStride();
 
+        const texture_data_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, texture.data));
         for (miny..adjusted_maxy) |y| {
             for (minx..adjusted_maxx) |x| {
-                for (0..4) |c| {
-                    texture.data[y * stride + x * 4 + c] = @intFromFloat(rgba[c] * 255.0);
-                }
+                texture_data_u32[y * texture.width_px + x] = color;
             }
         }
     }
@@ -108,6 +117,7 @@ pub const GraphicsPipelineInputs = struct {
     format: []shader.ShaderInput,
     ubo: []const u8, // reference to dumb_buffers data
     texture: Texture, // shallow copy of textures data
+    depth_texture: Texture, // shallow copy of textures data
     num_elems: usize,
 
     pub fn deinit(self: GraphicsPipelineInputs, alloc: Allocator) void {
@@ -133,7 +143,7 @@ pub const GraphicsPipelineInputs = struct {
             return;
         }
 
-        try rasterizeTriangles(alloc, vert_outputs, inputs.fs, inputs.texture);
+        try rasterizeTriangles(alloc, vert_outputs, inputs.fs, inputs.texture, inputs.depth_texture);
     }
 };
 
@@ -144,6 +154,7 @@ const GraphicsPipelineInputHandles = struct {
     ubo: u64,
     format: u64,
     output_tex: u64,
+    depth_tex: u64,
 };
 
 fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHandles, dumb_buffers: DumbBuffers, textures: Textures, num_elems: usize) !GraphicsPipelineInputs {
@@ -153,6 +164,7 @@ fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHand
     const ubo = dumb_buffers.get(handles.ubo) orelse return error.InvalidUboId;
     const format = dumb_buffers.get(handles.format) orelse return error.InvalidFormatId;
     const texture = textures.get(handles.output_tex) orelse return error.InvalidTextureId;
+    const depth_texture = textures.get(handles.depth_tex) orelse return error.InvalidTextureId;
 
     // FIXME: remove this hack
     const oversize_buffer_len = 8;
@@ -172,6 +184,7 @@ fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHand
         .ubo = ubo,
         .format = try alloc.dupe(shader.ShaderInput, shader_input_defs.value),
         .texture = texture,
+        .depth_texture = depth_texture,
         .num_elems = num_elems,
     };
 }
@@ -193,6 +206,7 @@ fn findXForY(start: PixelCoord, end: PixelCoord, y: usize, max: u32) usize {
 const TriangleRasterizer = struct {
     alloc: Allocator,
     texture_data_u32: []u32,
+    depth_texture_data_u32: []u32,
     texture_width_px: u32,
     texture_height_px: u32,
     frag_shader: shader.Shader,
@@ -228,11 +242,23 @@ const TriangleRasterizer = struct {
                 const p = lin.Vec2{@floatFromInt(x_px), @floatFromInt(y_px)};
                 const bary_a, const bary_b, const bary_c = bc.calc(p);
                 const frag_input = try interpolateVars(frag_inputs, bary_a, bary_b, bary_c);
+                const depth_output_f = bary_a * sorted_triangle[0].z + bary_b * sorted_triangle[1].z + bary_c * sorted_triangle[2].z;
+                if (depth_output_f < 0.0 or depth_output_f > 1.0) {
+                    std.debug.print("Unexpected depth: {d}\n", .{depth_output_f});
+                }
+                const depth_output = clampCastF32U32(depth_output_f * std.math.maxInt(u32), 0, std.math.maxInt(u32));
+
+                const u32_idx = y_px * self.texture_width_px + x_px;
+
+                if (depth_output > self.depth_texture_data_u32[u32_idx]) {
+                    continue;
+                }
 
                 var frag_inputs_mut = [1]shader.Variable{frag_input};
                 const frag_output = try self.frag_shader.executeOnInputs(self.alloc, &frag_inputs_mut, &.{});
                 const color = vec4ColorToU32(frag_output.marked.vec4);
-                self.texture_data_u32[y_px * self.texture_width_px + x_px] = color;
+                self.texture_data_u32[u32_idx] = color;
+                self.depth_texture_data_u32[u32_idx] = depth_output;
             }
         }
     }
@@ -278,6 +304,7 @@ fn clampCastF32U32(val: f32, min: u32, max: u32) u32 {
 const PixelCoord = struct {
     x: f32,
     y: f32,
+    z: f32,
     w: f32,
 
     pub fn vec2(self: PixelCoord) lin.Vec2 {
@@ -320,10 +347,13 @@ pub fn homogenousToPixelCoord(coord: Vec4, width: u32, height: u32) ?PixelCoord 
 
     const x_norm = coord[0] / coord[3];
     const y_norm = coord[1] / coord[3];
+    const z_norm = coord[2] / coord[3];
     const w_norm = coord[3];
+
     return PixelCoord {
         .x = (x_norm + 1.0) / 2 * @as(f32, @floatFromInt(width)),
         .y = height_f * (1.0 - (y_norm + 1.0) / 2),
+        .z = z_norm,
         .w = w_norm,
     };
 }
@@ -365,10 +395,13 @@ fn vec4ColorToU32(color: Vec4) u32 {
     return frag_color_u32;
 }
 
-fn rasterizeTriangles(alloc: Allocator, vert_outputs: shader.ShaderOutput, frag_shader: shader.Shader, texture: Texture) !void {
+fn rasterizeTriangles(alloc: Allocator, vert_outputs: shader.ShaderOutput, frag_shader: shader.Shader, texture: Texture, depth_texture: Texture) !void {
+    std.debug.assert(depth_texture.width_px == texture.width_px);
+    std.debug.assert(depth_texture.calcHeight() == texture.calcHeight());
     const rasterizer = TriangleRasterizer {
         .alloc = alloc,
         .texture_data_u32 = @alignCast(std.mem.bytesAsSlice(u32, texture.data)),
+        .depth_texture_data_u32 = @alignCast(std.mem.bytesAsSlice(u32, depth_texture.data)),
         .texture_height_px = texture.calcHeight(),
         .texture_width_px = texture.width_px,
         .frag_shader = frag_shader,
@@ -430,8 +463,17 @@ pub export fn libgpu_gpu_create_texture(gpu: *Gpu, id: u64, width: u32, height: 
     return true;
 }
 
-pub export fn libgpu_gpu_clear(gpu: *Gpu, id: u64, rgba: ?*f32, minx: u32, maxx: u32, miny: u32, maxy: u32) bool {
-    gpu.clear(id, rgba, minx, maxx, miny, maxy) catch |e| {
+pub export fn libgpu_gpu_clear_color(gpu: *Gpu, id: u64, rgba: ?*f32, minx: u32, maxx: u32, miny: u32, maxy: u32) bool {
+    gpu.clear_color(id, rgba, minx, maxx, miny, maxy) catch |e| {
+        std.log.err("Failed to allocate texture: {s}", .{@errorName(e)});
+        return false;
+    };
+
+    return true;
+}
+
+pub export fn libgpu_gpu_clear_depth(gpu: *Gpu, id: u64, val: u32, minx: u32, maxx: u32, miny: u32, maxy: u32) bool {
+    gpu.clear_u32(id, val, minx, maxx, miny, maxy) catch |e| {
         std.log.err("Failed to allocate texture: {s}", .{@errorName(e)});
         return false;
     };
@@ -491,7 +533,7 @@ pub export fn libgpu_gpu_get_dumb(gpu: *Gpu, id: u64, data: ?**anyopaque) bool {
     return true;
 }
 
-pub export fn libgpu_execute_graphics_pipeline(gpu: *Gpu, vs: u64, fs: u64, vb: u64, format: u64, ubo: u64, output_tex: u64, num_elems: usize) bool {
+pub export fn libgpu_execute_graphics_pipeline(gpu: *Gpu, vs: u64, fs: u64, vb: u64, format: u64, ubo: u64, output_tex: u64, depth_tex: u64, num_elems: usize) bool {
     var arena = std.heap.ArenaAllocator.init(gpu.alloc);
     defer arena.deinit();
 
@@ -506,6 +548,7 @@ pub export fn libgpu_execute_graphics_pipeline(gpu: *Gpu, vs: u64, fs: u64, vb: 
         .ubo = ubo,
         .format = format,
         .output_tex = output_tex,
+        .depth_tex = depth_tex,
     }, num_elems) catch |e| {
         std.log.err("Failed to execute graphics pipeline: {s}", .{@errorName(e)});
         return false;

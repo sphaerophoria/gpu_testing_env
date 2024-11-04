@@ -1,0 +1,80 @@
+From 142dbf9f07824f84797b1fec3138a40230ad8a18 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Tue, 5 Nov 2024 20:32:55 +0000
+Subject: [PATCH 8/9] Fix depth testing
+
+Pass depth buffer to GPU on clear/draw
+---
+ .../winsys/sphaero/drm/sphaero_drm_winsys.c   | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+index b7482ee..5ed4e55 100644
+--- a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
++++ b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+@@ -31,8 +31,9 @@ struct sphaero_shader_state {
+ 
+ struct sphaero_context {
+    struct pipe_context pc;
+    struct sphaero_resource* bound_texture;
++   struct sphaero_resource* zsbuf;
+    struct pipe_vertex_element* vertex_elements;
+    unsigned num_vertex_elements;
+    struct pipe_vertex_buffer vertex_buffer;
+    struct sphaero_shader_state vs;
+@@ -363,8 +364,9 @@ static void sphaero_drm_destroy(struct pipe_screen * screen) {
+ static void sphaero_ctx_set_framebuffer_state(struct pipe_context *pc,
+                               const struct pipe_framebuffer_state *state) {
+    struct sphaero_context* ctx = (struct sphaero_context*)pc;
+    ctx->bound_texture = (struct sphaero_resource*)state->cbufs[0]->texture;
++   ctx->zsbuf = (struct sphaero_resource*)state->zsbuf->texture;
+ }
+ 
+ static struct pipe_surface *sphaero_ctx_create_surface(struct pipe_context *ctx,
+                                                 struct pipe_resource *texture,
+@@ -402,19 +404,29 @@ static void sphaero_ctx_clear(struct pipe_context *pc,
+               unsigned stencil) {
+    struct sphaero_context *ctx = (struct sphaero_context*)pc;
+    struct sphaero_screen *screen = (struct sphaero_screen*)ctx->pc.screen;
+ 
+-   // FIXME: use depth/stencil/buffers/etc.
+    struct drm_sphaero_gl_clear clear_req = {
+-      .handle = ctx->bound_texture->handle,
++      .handle = UINT32_MAX,
++      .depth_handle = UINT32_MAX,
+    };
++
++   if (buffers & PIPE_CLEAR_DEPTH) {
++      clear_req.depth_handle = ctx->zsbuf->handle;
++      clear_req.depth = depth * UINT32_MAX;
++   }
++
+    if (scissor_state) {
+       clear_req.minx = scissor_state->minx;
+       clear_req.miny = scissor_state->miny;
+       clear_req.maxx = scissor_state->maxx;
+       clear_req.maxy = scissor_state->maxy;
+    }
+-   memcpy(clear_req.color, color->ui, 4 * sizeof(uint32_t));
++
++   if (buffers & PIPE_CLEAR_COLOR) {
++      clear_req.handle = ctx->bound_texture->handle;
++      memcpy(clear_req.color, color->ui, 4 * sizeof(uint32_t));
++   }
+ 
+    if (drmIoctl(screen->fd, DRM_IOCTL_SPHAERO_GL_CLEAR, &clear_req)) {
+       printf("clear failed\n");
+    }
+@@ -593,8 +605,9 @@ static void sphaero_ctx_draw_vbo(struct pipe_context *pipe,
+         // FIXME: Multiple ubos
+         .ubo_handle = ctx->gpu_ubos[0].handle,
+ 	.format_handle = input_defs_handle,
+ 	.texture_handle = ctx->bound_texture->handle,
++        .depth_texture_handle = ctx->zsbuf->handle,
+ 	.num_inputs = draws[0].count
+    };
+ 
+    if (drmIoctl(screen->fd, DRM_IOCTL_SPHAERO_EXEC_SHADER_PIPELINE, &exec_req)) {
+-- 
+2.44.1
+
