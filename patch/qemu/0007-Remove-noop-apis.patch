@@ -1,7 +1,7 @@
 From 35cbba7e86ec5b698934e42f6a2d691029706158 Mon Sep 17 00:00:00 2001
 From: Mick Sayson <mick@sayson.com>
 Date: Mon, 28 Oct 2024 20:04:32 +0000
-Subject: [PATCH] Remove noop apis
+Subject: [PATCH 07/12] Remove noop apis
 
 ---
  hw/misc/sphaero.c | 27 ---------------------------

@@ -1,25 +1,26 @@
-From ef507423b4be02b7b32b87f91a35b1d21f541edb Mon Sep 17 00:00:00 2001
+From 8cf854489ea39b710e0abb3eed9ee146fd51cb9f Mon Sep 17 00:00:00 2001
 From: Mick Sayson <mick@sayson.com>
 Date: Tue, 29 Oct 2024 21:51:01 +0000
-Subject: [PATCH] Add execute shader pipeline API
+Subject: [PATCH 08/12] Add execute shader pipeline API
 
 * Dispatch to libgpu for actual work
 * GPU shader execution required more than the existing 10 args, add
   calculated num args macro that is tied to PCI bar size
 ---
- hw/misc/sphaero.c | 19 +++++++++++++++++--
- 1 file changed, 17 insertions(+), 2 deletions(-)
+ hw/misc/sphaero.c | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
 
 diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
-index beaf290b8..cf3f04a79 100644
+index beaf290b8..ac4d7148c 100644
 --- a/hw/misc/sphaero.c
 +++ b/hw/misc/sphaero.c
-@@ -21,12 +21,14 @@ typedef enum SphaeroRegCommand {
+@@ -21,12 +21,15 @@ typedef enum SphaeroRegCommand {
      SPHAERO_REG_CMD_SET_HW_FB,
      SPHAERO_REG_CMD_ALLOC_HW_BUF,
      SPHAERO_REG_CMD_MAP_HW_BUF,
      SPHAERO_REG_CMD_SET_DUMB_FB,
 +    SPHAERO_REG_CMD_EXEC_SHADER_PIPELINE,
++    SPHAERO_REG_CMD_FREE_HW_BUF,
      SPHAERO_REG_CMD_MAX,
  } SphaeroRegCommand;
  
@@ -30,7 +31,7 @@ index beaf290b8..cf3f04a79 100644
  #define SPHAERO_TRANSFORM_SIZE (16 * sizeof(float))
  
  
-@@ -140,8 +142,21 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+@@ -140,8 +143,26 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
              dpy_gfx_replace_surface(s->console, ds);
              dpy_gfx_update_full(s->console);
              break;
@@ -48,11 +49,16 @@ index beaf290b8..cf3f04a79 100644
 +            libgpu_execute_graphics_pipeline(s->gpu, vs_handle, fs_handle, vb_handle, vb_format_handle, tex_handle, num_elems);
 +            break;
 +        }
++        case SPHAERO_REG_CMD_FREE_HW_BUF: {
++            uint64_t handle = *(uint64_t*)s->args;
++            libgpu_free_dumb(s->gpu, handle);
++            break;
++        }
          case SPHAERO_REG_CMD_MAX:
              assert(false);
              return;
      }
-@@ -228,9 +243,9 @@ static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
+@@ -228,9 +249,9 @@ static void pci_sphaero_realize(PCIDevice *dev, Error **errp)
  {
      SphaeroState *s = SPHAERO(dev);
  
