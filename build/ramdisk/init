@@ -1,0 +1,21 @@
+#!/bin/sh
+
+set -ex
+
+mkdir -p /proc
+mkdir -p /sys
+mkdir -p /dev
+mkdir -p /mnt/root
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
+
+insmod /sphaero-gpu.ko
+
+mount -o ro /dev/vda /mnt/root
+mount -t proc none /mnt/root/proc
+mount -t sysfs none /mnt/root/sys
+mount -t devtmpfs none /mnt/root/dev
+
+exec switch_root /mnt/root /sbin/init
