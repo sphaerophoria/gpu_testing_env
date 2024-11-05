@@ -19,6 +19,6 @@ bool libgpu_gpu_get_dumb(struct libgpu_gpu* gpu, uint64_t id, void** data);
 
 bool libgpu_gpu_get_tex_data(struct libgpu_gpu* gpu, uint64_t id, uint32_t* width, uint32_t* height, uint32_t* stride, void** data);
 
-bool libgpu_execute_graphics_pipeline(struct libgpu_gpu* gpu, uint64_t vs, uint64_t fs, uint64_t vb, uint64_t format, uint64_t ubo, uint64_t output_tex, uint64_t depth_tex, size_t num_inputs);
+bool libgpu_execute_graphics_pipeline(struct libgpu_gpu* gpu, uint64_t vs, uint64_t fs, uint64_t vb, uint64_t format, uint64_t ubo, uint64_t output_tex, uint64_t depth_tex, uint64_t sampler_tex, size_t num_inputs);
 
 #endif //__SPHAERO_LIBGPU_H__

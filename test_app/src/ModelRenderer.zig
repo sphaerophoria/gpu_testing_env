@@ -5,6 +5,9 @@ const gl = @cImport({
     @cDefine("GL_GLEXT_PROTOTYPES", "");
     @cInclude("GL/gl.h");
 });
+const stbi = @cImport({
+    @cInclude("stb_image.h");
+});
 const ModelRenderer = @This();
 
 model_transform: Mat4 = Mat4.identity(),
@@ -15,6 +18,7 @@ buffers: BufferPair,
 program: gl.GLuint,
 num_vertices: c_int,
 transform_loc: c_int,
+texture: gl.GLuint,
 
 pub fn init(alloc: Allocator) !ModelRenderer {
     var model = try Model.load(alloc, @embedFile("ModelRenderer/model.obj"));
@@ -22,6 +26,12 @@ pub fn init(alloc: Allocator) !ModelRenderer {
 
     const buffers = try bindModel(alloc, model);
     //errdefer buffers.deinit();
+
+    var img = try Img.init(@embedFile("ModelRenderer/model.png"));
+    defer img.deinit();
+
+    const texture = texFromImg(img);
+    //errdefer gl.glDeleteTextures(1, &texture);
 
     const program = try compileLinkProgram(
         @embedFile("ModelRenderer/vertex.glsl"),
@@ -37,17 +47,21 @@ pub fn init(alloc: Allocator) !ModelRenderer {
         .program = program,
         .transform_loc = transform_loc,
         .num_vertices = num_vertices,
+        .texture = texture,
     };
 }
 
 pub fn deinit(self: *ModelRenderer) void {
     self.buffers.deinit();
+    gl.glDeleteTextures(1, &self.texture);
     gl.glDeleteProgram(self.program);
 }
 
 pub fn render(self: *ModelRenderer, aspect: f32) void {
     gl.glUseProgram(self.program);
     gl.glBindVertexArray(self.buffers.vao);
+    gl.glActiveTexture(gl.GL_TEXTURE0); // activate the texture unit first before binding texture
+    gl.glBindTexture(gl.GL_TEXTURE_2D, self.texture);
 
     const perspective = Mat4.perspective(self.fov, 0.1, aspect);
     const transform = perspective.matmul(Mat4.translation(0.0, 0.0, -10.0).matmul(self.model_transform));
@@ -88,6 +102,11 @@ fn compileLinkProgram(vs: []const u8, fs: []const u8) !gl.GLuint {
     gl.glCompileShader(fragment_shader);
     gl.glGetShaderiv(fragment_shader, gl.GL_COMPILE_STATUS, &success);
     if (success == 0) {
+        var buf: [1024]u8 = undefined;
+        var print_len: gl.GLsizei = 0;
+        gl.glGetShaderInfoLog(fragment_shader, @intCast(buf.len), &print_len, &buf);
+        std.log.err("Fragment shader compilation failed", .{});
+        std.log.err("{s}", .{buf[0..@intCast(print_len)]});
         return error.FragmentShaderCompile;
     }
 
@@ -441,4 +460,44 @@ fn bindModel(alloc: Allocator, model: Model) !BufferPair {
         .vao = vao,
         .vbo = vbo,
     };
+}
+
+const Img = struct {
+    data: []u32,
+    width: usize,
+
+    pub fn init(data: []const u8) !Img {
+        var width: c_int = 0;
+        var height_out: c_int = 0;
+        stbi.stbi_set_flip_vertically_on_load(1);
+        const img_opt = stbi.stbi_load_from_memory(data.ptr, @intCast(data.len), &width, &height_out, null, 4);
+        const img_ptr: [*]u8 = img_opt orelse return error.FailedToOpen;
+        const img_u32: [*]u32 = @ptrCast(@alignCast(img_ptr));
+
+        return .{
+            .data = img_u32[0..@intCast(width * height_out)],
+            .width = @intCast(width),
+        };
+    }
+
+    pub fn deinit(self: *Img) void {
+        stbi.stbi_image_free(@ptrCast(self.data));
+    }
+
+    pub fn height(self: Img) usize {
+        return self.data.len / self.width;
+    }
+};
+
+fn texFromImg(img: Img) gl.GLuint {
+    var texture: gl.GLuint = 0;
+    gl.glGenTextures(1, &texture);
+
+    gl.glBindTexture(gl.GL_TEXTURE_2D, texture);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR);
+
+    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, @intCast(img.width), @intCast(img.height()), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, img.data.ptr);
+
+    return texture;
 }

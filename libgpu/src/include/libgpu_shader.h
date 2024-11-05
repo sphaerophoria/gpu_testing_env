@@ -67,6 +67,8 @@ bool libgpu_shader_push_command_load_constant_vec2(struct libgpu_shader* shader,
 bool libgpu_shader_push_command_load_constant_vec4(struct libgpu_shader* shader, uint32_t id, float x, float y, float z, float w);
 bool libgpu_shader_push_command_load(struct libgpu_shader* shader, uint32_t src, uint32_t dest);
 bool libgpu_shader_push_command_store(struct libgpu_shader* shader, uint32_t src, uint32_t dest);
+bool libgpu_shader_push_tex_sample(struct libgpu_shader* shader, uint32_t id, uint32_t src);
+
 
 struct libgpu_shader_input_defs;
 struct libgpu_shader_input_defs* libgpu_shader_create_input_defs(void);

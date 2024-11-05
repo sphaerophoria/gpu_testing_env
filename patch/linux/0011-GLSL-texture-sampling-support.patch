@@ -1,0 +1,74 @@
+From d59ef16f0be71a9a63d5e028a34495ae9838294f Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Tue, 5 Nov 2024 12:10:14 -0800
+Subject: [PATCH 11/11] GLSL texture sampling support
+
+* Add 1 texture to the inputs of the shader pipeline
+* Add support for mmapping textures
+---
+ drivers/gpu/drm/sphaero/sphaero_drv.c | 10 +++++++---
+ include/uapi/drm/sphaero_drm.h        |  1 +
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/sphaero/sphaero_drv.c b/drivers/gpu/drm/sphaero/sphaero_drv.c
+index bd1d6ee26..f8fe478d0 100644
+--- a/drivers/gpu/drm/sphaero/sphaero_drv.c
++++ b/drivers/gpu/drm/sphaero/sphaero_drv.c
+@@ -532,14 +532,15 @@ static int sphaero_gpu_map_gpu_obj_ioctl(struct drm_device *dev, void *data,
+ }
+ 
+ static int sphaero_gpu_create_gl_tex_ioctl(struct drm_device *dev, void *data,
+ 				struct drm_file *file) {
+-	struct drm_gem_sphaero_obj *obj = drm_gem_sphaero_create(dev, 0 /*No way to map to userspace*/);
++	struct drm_sphaero_create_gl_tex *params = data;
++	// Assumed format of RGBA32
++	struct drm_gem_sphaero_obj *obj = drm_gem_sphaero_create(dev, params->width * params->height * 4);
+ 	if (IS_ERR(obj)) {
+ 		return PTR_ERR(obj);
+ 	}
+ 	struct sphaero_priv* priv = dev->dev_private;
+-	struct drm_sphaero_create_gl_tex *params = data;
+ 	priv->regs[1] = obj->hw_id;
+ 	priv->regs[2] = obj->hw_id >> 32;
+ 	priv->regs[3] = params->width;
+ 	priv->regs[4] = params->height;
+@@ -604,8 +605,9 @@ static int sphaero_gpu_exec_shader_pipeline(struct drm_device *dev, void *data,
+ 	uint64_t format = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->format_handle));
+ 	uint64_t ubo = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->ubo_handle));
+ 	uint64_t texture = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->texture_handle));
+ 	uint64_t depth_texture = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->depth_texture_handle));
++	uint64_t sampler_texture = sphaero_gpu_hw_id_from_gem_obj(drm_gem_object_lookup(file, params->sampler_texture_handle));
+ 
+ 	priv->regs[1] = vs;
+ 	priv->regs[2] = vs >> 32;
+ 	priv->regs[3] = fs;
+@@ -619,9 +621,11 @@ static int sphaero_gpu_exec_shader_pipeline(struct drm_device *dev, void *data,
+ 	priv->regs[11] = texture;
+ 	priv->regs[12] = texture >> 32;
+ 	priv->regs[13] = depth_texture;
+ 	priv->regs[14] = depth_texture >> 32;
+-	priv->regs[15] = params->num_inputs;
++	priv->regs[15] = sampler_texture;
++	priv->regs[16] = sampler_texture >> 32;
++	priv->regs[17] = params->num_inputs;
+ 	priv->regs[0] = SPHAERO_REG_CMD_EXEC_SHADER_PIPELINE;
+ 
+ 	return 0;
+ }
+diff --git a/include/uapi/drm/sphaero_drm.h b/include/uapi/drm/sphaero_drm.h
+index 4e5ae842a..772d42acb 100644
+--- a/include/uapi/drm/sphaero_drm.h
++++ b/include/uapi/drm/sphaero_drm.h
+@@ -58,8 +58,9 @@ struct drm_sphaero_exec_shader_pipeline {
+ 	__u32 ubo_handle;
+ 	__u32 format_handle;
+ 	__u32 texture_handle;
+ 	__u32 depth_texture_handle;
++	__u32 sampler_texture_handle;
+ 	__u32 num_inputs;
+ };
+ 
+ 
+-- 
+2.44.1
+

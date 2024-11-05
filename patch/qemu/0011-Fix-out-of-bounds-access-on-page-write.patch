@@ -1,0 +1,43 @@
+From 30235805c5e989a280658249a5a2153e6c758b86 Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Tue, 5 Nov 2024 12:10:44 -0800
+Subject: [PATCH 11/12] Fix out of bounds access on page write
+
+Previously we structured writes as a 64 bit write with a mask. This
+causes issues when we hit the end of a buffer. A 4 byte write 4 bytes
+from the end of the buffer can segfault because we're writing 8 bytes,
+even if the last 4 bytes have no effect
+
+Use the correctly sized writes
+---
+ hw/misc/sphaero.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index 5fe9c0b61..725737d25 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -224,10 +224,18 @@ static void sphaero_mapped_gpu_mem_write(void *opaque,
+                   uint64_t data,
+                   unsigned size) {
+     SphaeroState* s = opaque;
+     SphaeroBarPageAddr bar_addr = sphaero_resolve_bar_addr(s, addr, size);
+-    *bar_addr.elem &= ~bar_addr.mask;
+-    *bar_addr.elem |= data & bar_addr.mask;
++    switch (size) {
++        case 1: *(uint8_t*)bar_addr.elem = data;break;
++        case 2: *(uint16_t*)bar_addr.elem = data;break;
++        case 4: *(uint32_t*)bar_addr.elem = data;break;
++        case 8: *(uint64_t*)bar_addr.elem = data;break;
++        default: {
++            *bar_addr.elem &= ~bar_addr.mask;
++            *bar_addr.elem |= data & bar_addr.mask;
++        }
++    }
+ }
+ 
+ static uint64_t sphaero_mapped_gpu_mem_read(void *opaque,
+                  hwaddr addr,
+-- 
+2.44.1
+

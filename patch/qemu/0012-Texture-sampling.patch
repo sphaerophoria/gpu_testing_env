@@ -1,0 +1,48 @@
+From bde29437f5faca092b38f84ad6d3036597ae1a4d Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Tue, 5 Nov 2024 12:11:02 -0800
+Subject: [PATCH 12/12] Texture sampling
+
+* Add support for mapping textures
+* Pass sampler texture to shader pipeline execution
+---
+ hw/misc/sphaero.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/hw/misc/sphaero.c b/hw/misc/sphaero.c
+index 725737d25..1c231dfaf 100644
+--- a/hw/misc/sphaero.c
++++ b/hw/misc/sphaero.c
+@@ -117,10 +117,12 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+             uint32_t dest_page = *(s->args + 3);
+ 
+             void* buf;
+             if (!libgpu_gpu_get_dumb(s->gpu, hw_id, &buf)) {
+-                printf("Failed to map %d\n", dest_page);
+-                break;
++                if (!libgpu_gpu_get_tex_data(s->gpu, hw_id, NULL, NULL, NULL, &buf)) {
++                    printf("Failed to map %d\n", dest_page);
++                    break;
++                }
+             }
+             s->pages[dest_page] = (buf + page_offs * SPHAERO_PAGE_SIZE);
+             break;
+         }
+@@ -156,11 +158,12 @@ static void sphaero_run_command(SphaeroState* s, SphaeroRegCommand cmd) {
+             uint64_t vb_format_handle = *(uint64_t*)(s->args + 6);
+             uint64_t ubo_handle = *(uint64_t*)(s->args + 8);
+             uint64_t tex_handle = *(uint64_t*)(s->args + 10);
+             uint64_t depth_tex_handle = *(uint64_t*)(s->args + 12);
+-            uint32_t num_elems = *(s->args + 14);
++            uint64_t sampler_handle = *(uint64_t*)(s->args + 14);
++            uint32_t num_elems = *(s->args + 16);
+ 
+-            libgpu_execute_graphics_pipeline(s->gpu, vs_handle, fs_handle, vb_handle, vb_format_handle, ubo_handle, tex_handle, depth_tex_handle, num_elems);
++            libgpu_execute_graphics_pipeline(s->gpu, vs_handle, fs_handle, vb_handle, vb_format_handle, ubo_handle, tex_handle, depth_tex_handle, sampler_handle, num_elems);
+             break;
+         }
+         case SPHAERO_REG_CMD_FREE_HW_BUF: {
+             uint64_t handle = *(uint64_t*)s->args;
+-- 
+2.44.1
+

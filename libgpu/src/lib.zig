@@ -118,6 +118,7 @@ pub const GraphicsPipelineInputs = struct {
     ubo: []const u8, // reference to dumb_buffers data
     texture: Texture, // shallow copy of textures data
     depth_texture: Texture, // shallow copy of textures data
+    sampler_texture: Texture, //shallow copy of textures data
     num_elems: usize,
 
     pub fn deinit(self: GraphicsPipelineInputs, alloc: Allocator) void {
@@ -136,14 +137,14 @@ pub const GraphicsPipelineInputs = struct {
     }
 
     pub fn execute(inputs: GraphicsPipelineInputs, alloc: Allocator) !void {
-        const vert_outputs = try inputs.vs.executeOnBuf(alloc, inputs.vb, inputs.format, inputs.ubo, inputs.num_elems);
+        const vert_outputs = try inputs.vs.executeOnBuf(alloc, inputs.vb, inputs.format, inputs.ubo, inputs.sampler_texture, inputs.num_elems);
         defer vert_outputs.deinit(alloc);
 
         if (vert_outputs.marked.len < 3) {
             return;
         }
 
-        try rasterizeTriangles(alloc, vert_outputs, inputs.fs, inputs.texture, inputs.depth_texture);
+        try rasterizeTriangles(alloc, vert_outputs, inputs.fs, inputs.texture, inputs.depth_texture, inputs.sampler_texture);
     }
 };
 
@@ -155,6 +156,7 @@ const GraphicsPipelineInputHandles = struct {
     format: u64,
     output_tex: u64,
     depth_tex: u64,
+    sampler_tex: u64,
 };
 
 fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHandles, dumb_buffers: DumbBuffers, textures: Textures, num_elems: usize) !GraphicsPipelineInputs {
@@ -165,6 +167,7 @@ fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHand
     const format = dumb_buffers.get(handles.format) orelse return error.InvalidFormatId;
     const texture = textures.get(handles.output_tex) orelse return error.InvalidTextureId;
     const depth_texture = textures.get(handles.depth_tex) orelse return error.InvalidTextureId;
+    const sampler_texture = textures.get(handles.sampler_tex) orelse return error.InvalidTextureId;
 
     // FIXME: remove this hack
     const oversize_buffer_len = 8;
@@ -185,6 +188,7 @@ fn getGraphicsPiplineInputs(alloc: Allocator, handles: GraphicsPipelineInputHand
         .format = try alloc.dupe(shader.ShaderInput, shader_input_defs.value),
         .texture = texture,
         .depth_texture = depth_texture,
+        .sampler_texture = sampler_texture,
         .num_elems = num_elems,
     };
 }
@@ -207,6 +211,7 @@ const TriangleRasterizer = struct {
     alloc: Allocator,
     texture_data_u32: []u32,
     depth_texture_data_u32: []u32,
+    sampler_texture: Texture,
     texture_width_px: u32,
     texture_height_px: u32,
     frag_shader: shader.Shader,
@@ -255,7 +260,7 @@ const TriangleRasterizer = struct {
                 }
 
                 var frag_inputs_mut = [1]shader.Variable{frag_input};
-                const frag_output = try self.frag_shader.executeOnInputs(self.alloc, &frag_inputs_mut, &.{});
+                const frag_output = try self.frag_shader.executeOnInputs(self.alloc, &frag_inputs_mut, &.{}, self.sampler_texture);
                 const color = vec4ColorToU32(frag_output.marked.vec4);
                 self.texture_data_u32[u32_idx] = color;
                 self.depth_texture_data_u32[u32_idx] = depth_output;
@@ -395,13 +400,14 @@ fn vec4ColorToU32(color: Vec4) u32 {
     return frag_color_u32;
 }
 
-fn rasterizeTriangles(alloc: Allocator, vert_outputs: shader.ShaderOutput, frag_shader: shader.Shader, texture: Texture, depth_texture: Texture) !void {
+fn rasterizeTriangles(alloc: Allocator, vert_outputs: shader.ShaderOutput, frag_shader: shader.Shader, texture: Texture, depth_texture: Texture, sampler_texture: Texture) !void {
     std.debug.assert(depth_texture.width_px == texture.width_px);
     std.debug.assert(depth_texture.calcHeight() == texture.calcHeight());
     const rasterizer = TriangleRasterizer {
         .alloc = alloc,
         .texture_data_u32 = @alignCast(std.mem.bytesAsSlice(u32, texture.data)),
         .depth_texture_data_u32 = @alignCast(std.mem.bytesAsSlice(u32, depth_texture.data)),
+        .sampler_texture = sampler_texture,
         .texture_height_px = texture.calcHeight(),
         .texture_width_px = texture.width_px,
         .frag_shader = frag_shader,
@@ -533,7 +539,7 @@ pub export fn libgpu_gpu_get_dumb(gpu: *Gpu, id: u64, data: ?**anyopaque) bool {
     return true;
 }
 
-pub export fn libgpu_execute_graphics_pipeline(gpu: *Gpu, vs: u64, fs: u64, vb: u64, format: u64, ubo: u64, output_tex: u64, depth_tex: u64, num_elems: usize) bool {
+pub export fn libgpu_execute_graphics_pipeline(gpu: *Gpu, vs: u64, fs: u64, vb: u64, format: u64, ubo: u64, output_tex: u64, depth_tex: u64, sampler_tex: u64, num_elems: usize) bool {
     var arena = std.heap.ArenaAllocator.init(gpu.alloc);
     defer arena.deinit();
 
@@ -549,6 +555,7 @@ pub export fn libgpu_execute_graphics_pipeline(gpu: *Gpu, vs: u64, fs: u64, vb: 
         .format = format,
         .output_tex = output_tex,
         .depth_tex = depth_tex,
+        .sampler_tex = sampler_tex,
     }, num_elems) catch |e| {
         std.log.err("Failed to execute graphics pipeline: {s}", .{@errorName(e)});
         return false;

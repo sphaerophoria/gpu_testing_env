@@ -5,6 +5,7 @@ const lin = @import("lin.zig");
 const Vec2 = lin.Vec2;
 const Vec3 = lin.Vec3;
 const Vec4 = lin.Vec4;
+const libgpu = @import("lib.zig");
 
 const ReferenceType = enum {
     input,
@@ -126,6 +127,10 @@ const Command = union(enum) {
         b: u32,
         output: u32,
     },
+    sample_tex: struct {
+        src: u32,
+        output: u32,
+    },
 };
 
 pub const ShaderInput = struct {
@@ -155,7 +160,7 @@ const ShaderExecutor = struct {
     alloc: Allocator,
     shader: Shader,
 
-    pub fn executeOnBuf(self: ShaderExecutor, input_data: []const u8, input_defs: []const ShaderInput, ubo: []const u8, num_indices: usize) !ShaderOutput {
+    pub fn executeOnBuf(self: ShaderExecutor, input_data: []const u8, input_defs: []const ShaderInput, ubo: []const u8, sampler_texture: libgpu.Texture, num_indices: usize) !ShaderOutput {
         const marked_outputs = try self.alloc.alloc(Variable, num_indices);
         const unmarked_outputs = try self.alloc.alloc(?Variable, num_indices);
 
@@ -163,7 +168,7 @@ const ShaderExecutor = struct {
             const input_group = try extractInputsFromBuf(self.alloc, group_idx, input_data, input_defs);
             defer self.alloc.free(input_group);
 
-            const one_ret =  try self.executeOnInputs(input_group, ubo);
+            const one_ret =  try self.executeOnInputs(input_group, ubo, sampler_texture);
 
             marked_outputs[group_idx] = one_ret.marked;
             unmarked_outputs[group_idx] = one_ret.unmarked;
@@ -175,7 +180,7 @@ const ShaderExecutor = struct {
     }
 
     // inputs may be modified
-    pub fn executeOnInputs(self: ShaderExecutor, inputs: []Variable, ubo: []const u8) !SingleShaderOutput {
+    pub fn executeOnInputs(self: ShaderExecutor, inputs: []Variable, ubo: []const u8, sampler_texture: libgpu.Texture) !SingleShaderOutput {
         const outputs = try makeShaderOutputs(self.alloc, self.shader.output_types);
         defer self.alloc.free(outputs);
 
@@ -272,6 +277,29 @@ const ShaderExecutor = struct {
                             @panic("Unimplemented");
                         },
                     }
+                },
+                .sample_tex => |t| {
+                    const height = sampler_texture.calcHeight();
+                    const stride = sampler_texture.calcStride();
+                    const src = ssas.get(t.src) orelse return error.InvalidReference;
+                    const uv = src.vec2;
+                    const x: i64 = @intFromFloat(uv[0] * @as(f32, @floatFromInt(sampler_texture.width_px)));
+                    const y: i64 = @intFromFloat(uv[1] * @as(f32, @floatFromInt(height)));
+                    const y_u: usize = @intCast(@mod(y, height));
+                    const x_u: usize = @intCast(@mod(x, sampler_texture.width_px));
+                    const start = y_u * stride + x_u * 4;
+
+                    const r: f32 = @floatFromInt(sampler_texture.data[start + 2]);
+                    const g: f32 = @floatFromInt(sampler_texture.data[start + 1]);
+                    const b: f32 = @floatFromInt(sampler_texture.data[start + 0]);
+                    const a: f32 = @floatFromInt(sampler_texture.data[start + 3]);
+
+                    try ssas.put(self.alloc, t.output, .{ .vec4 = .{
+                        r / 255.0,
+                        g / 255.0,
+                        b / 255.0,
+                        a / 255.0,
+                    }});
                 },
             }
         }
@@ -391,22 +419,22 @@ pub const Shader = struct {
         alloc.free(self.output_types);
     }
 
-    pub fn executeOnBuf(self: Shader, alloc: Allocator, vertex_buf: []const u8, format: []ShaderInput, ubo: []const u8, num_elems: usize) !ShaderOutput {
+    pub fn executeOnBuf(self: Shader, alloc: Allocator, vertex_buf: []const u8, format: []ShaderInput, ubo: []const u8,  sampler_texture: libgpu.Texture, num_elems: usize) !ShaderOutput {
         const executor = ShaderExecutor {
             .alloc = alloc,
             .shader = self,
         };
 
-        return try executor.executeOnBuf(vertex_buf, format, ubo, num_elems);
+        return try executor.executeOnBuf(vertex_buf, format, ubo, sampler_texture, num_elems);
     }
 
-    pub fn executeOnInputs(self: Shader, alloc: Allocator, inputs: []Variable, ubo: []const u8) !SingleShaderOutput {
+    pub fn executeOnInputs(self: Shader, alloc: Allocator, inputs: []Variable, ubo: []const u8, sampler_texture: libgpu.Texture) !SingleShaderOutput {
         const executor = ShaderExecutor {
             .alloc = alloc,
             .shader = self,
         };
 
-        return try executor.executeOnInputs(inputs, ubo);
+        return try executor.executeOnInputs(inputs, ubo, sampler_texture);
     }
 };
 

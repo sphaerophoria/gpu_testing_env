@@ -1,0 +1,189 @@
+From 8d6f53a6c376aa58dc5be6e2a9372dcbcf3a589a Mon Sep 17 00:00:00 2001
+From: Mick Sayson <mick@sayson.com>
+Date: Mon, 4 Nov 2024 23:57:37 +0000
+Subject: [PATCH 9/9] Texture mapping
+
+Implement whatever has to be implemented to sample a 2d texture in a
+fragment shader. Not much regard here for correctness
+
+* Map textures
+* Unconditionally give texture to shader pipeline execution
+* Implement texture sampling command
+---
+ .../winsys/sphaero/drm/sphaero_drm_winsys.c   | 97 ++++++++++++++++++-
+ 1 file changed, 93 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+index 5ed4e55..6af09cd 100644
+--- a/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
++++ b/src/gallium/winsys/sphaero/drm/sphaero_drm_winsys.c
+@@ -12,8 +12,9 @@
+ #include "compiler/nir/nir_deref.h"
+ #include <xf86drm.h>
+ #include "util/format/u_format.h"
+ #include <sys/mman.h>
++#include "util/u_transfer.h"
+ 
+ 
+ struct sphaero_resource {
+    struct pipe_resource pr;
+@@ -38,8 +39,9 @@ struct sphaero_context {
+    struct pipe_vertex_buffer vertex_buffer;
+    struct sphaero_shader_state vs;
+    struct sphaero_shader_state fs;
+    struct sphaero_ubo gpu_ubos[PIPE_MAX_CONSTANT_BUFFERS];
++   struct sphaero_resource* sampler_texture;
+ };
+ 
+ struct sphaero_screen {
+    struct pipe_screen ps;
+@@ -113,19 +115,23 @@ static int sphaero_alloc_gpu_obj(int fd, size_t size, uint32_t* handle) {
+       *handle = create_req.handle;
+       return 0;
+ }
+ 
+-static int sphaero_copy_to_gpu(int fd, uint32_t gpu_handle, const void* data, size_t size) {
++static void* sphaero_map_gpu_obj(int fd, uint32_t gpu_handle, size_t size) {
+    struct drm_sphaero_map_gpu_obj map_req = {
+       .handle = gpu_handle,
+    };
+ 
+    if (drmIoctl(fd, DRM_IOCTL_SPHAERO_MAP_GPU_OBJ, &map_req)) {
+-      fprintf(stderr, "map failed\n");
+-      return errno;
++      fprintf(stderr, "map failed %d\n", errno);
++      return NULL;
+    }
+ 
+-   void* out = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, map_req.offset);
++   return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, map_req.offset);
++}
++
++static int sphaero_copy_to_gpu(int fd, uint32_t gpu_handle, const void* data, size_t size) {
++   void* out = sphaero_map_gpu_obj(fd, gpu_handle, size);
+    memcpy(out, data, size);
+    munmap(out, size);
+ 
+    return 0;
+@@ -269,8 +275,14 @@ static void *sphaero_compile_shader(int fd, struct libgpu_shader* libgpu_shader,
+                      assert(!"Unhandled num components for load const");
+                }
+                break;
+             }
++            case nir_instr_type_tex: {
++               nir_tex_instr* tex = nir_instr_as_tex(instr);
++               assert(tex->num_srcs == 1);
++               libgpu_shader_push_tex_sample(libgpu_shader, tex->def.index, tex->src[0].src.ssa->index);
++               break;
++            }
+             default:
+                assert(!"Unhandled type");
+          }
+       }
+@@ -606,8 +618,9 @@ static void sphaero_ctx_draw_vbo(struct pipe_context *pipe,
+         .ubo_handle = ctx->gpu_ubos[0].handle,
+ 	.format_handle = input_defs_handle,
+ 	.texture_handle = ctx->bound_texture->handle,
+         .depth_texture_handle = ctx->zsbuf->handle,
++        .sampler_texture_handle = ctx->sampler_texture->handle,
+ 	.num_inputs = draws[0].count
+    };
+ 
+    if (drmIoctl(screen->fd, DRM_IOCTL_SPHAERO_EXEC_SHADER_PIPELINE, &exec_req)) {
+@@ -642,8 +655,77 @@ static void sphaero_set_constant_buffer(struct pipe_context * pc,
+       assert(!"Unimplemented set constant buffer for existing pipe resource");
+    }
+ }
+ 
++
++static struct pipe_sampler_view * sphaero_ctx_create_sampler_view(struct pipe_context *ctx,
++                                                  struct pipe_resource *texture,
++                                                  const struct pipe_sampler_view *templat) {
++   struct pipe_sampler_view *sampler_view = CALLOC_STRUCT(pipe_sampler_view);
++
++   if (!sampler_view)
++      return NULL;
++
++   /* initialize base object */
++   *sampler_view = *templat;
++   sampler_view->texture = texture;
++   pipe_resource_reference(&sampler_view->texture, texture);
++   pipe_reference_init(&sampler_view->reference, 1);
++   sampler_view->context = ctx;
++   return sampler_view;
++}
++
++static void sphaero_ctx_set_sampler_views(struct pipe_context *pc,
++                          enum pipe_shader_type shader,
++                          unsigned start_slot, unsigned num_views,
++                          unsigned unbind_num_trailing_slots,
++                          bool take_ownership,
++                          struct pipe_sampler_view **views) {
++   assert(num_views == 1);
++   struct sphaero_context *ctx = (struct sphaero_context*)pc;
++   ctx->sampler_texture = (struct sphaero_resource*)views[0]->texture;
++}
++
++static void * sphaero_ctx_texture_map(struct pipe_context * pc,
++                     struct pipe_resource *pr,
++                     unsigned level,
++                     unsigned usage,  /* a combination of PIPE_MAP_x */
++                     const struct pipe_box *box,
++                     struct pipe_transfer **out_transfer) {
++
++   struct sphaero_context *ctx = (struct sphaero_context*) pc;
++   struct sphaero_screen *screen = (struct sphaero_screen*)pc->screen;
++   struct sphaero_resource *resource = (struct sphaero_resource*)pr;
++   struct pipe_transfer* transfer = CALLOC_STRUCT(pipe_transfer);
++
++   *out_transfer = transfer;
++   transfer->level = level;
++   transfer->usage = usage;
++   transfer->box = *box;
++   transfer->stride = resource->pr.width0 * 4;
++   transfer->layer_stride = transfer->stride;// no idea if this is right
++   size_t size = resource->pr.width0 * resource->pr.height0 * 4;
++   void* data = sphaero_map_gpu_obj(screen->fd, resource->handle, size);
++   memset(data, 0xff, size);
++   return data;
++}
++
++static void sphaero_ctx_texture_unmap(struct pipe_context *,
++                      struct pipe_transfer *transfer) {
++
++}
++
++static void * sphaero_ctx_create_sampler_state(struct pipe_context *,
++                               const struct pipe_sampler_state *) {
++   return (void*)0xdeadbeef;
++}
++
++static void   sphaero_ctx_bind_sampler_states(struct pipe_context *,
++                              enum pipe_shader_type shader,
++                              unsigned start_slot, unsigned num_samplers,
++                              void **samplers) {
++
++}
+ static struct pipe_context* sphaero_context_create(struct pipe_screen *screen,
+                                         void *priv, unsigned flags) {
+    struct sphaero_context* ctx = CALLOC_STRUCT(sphaero_context);
+    for (int i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; ++i) {
+@@ -674,8 +756,15 @@ static struct pipe_context* sphaero_context_create(struct pipe_screen *screen,
+    ctx->pc.bind_vertex_elements_state = sphaero_ctx_bind_vertex_elements_state;
+    ctx->pc.set_vertex_buffers = sphaero_ctx_set_vertex_buffers;
+    ctx->pc.draw_vbo = sphaero_ctx_draw_vbo;
+    ctx->pc.set_constant_buffer = sphaero_set_constant_buffer;
++   ctx->pc.texture_map = sphaero_ctx_texture_map;
++   ctx->pc.texture_subdata = u_default_texture_subdata;
++   ctx->pc.texture_unmap = sphaero_ctx_texture_unmap;
++   ctx->pc.create_sampler_view = sphaero_ctx_create_sampler_view;
++   ctx->pc.set_sampler_views = sphaero_ctx_set_sampler_views;
++   ctx->pc.create_sampler_state = sphaero_ctx_create_sampler_state;
++   ctx->pc.bind_sampler_states = sphaero_ctx_bind_sampler_states;
+    return &ctx->pc;
+ }
+ 
+ static struct pipe_resource* sphaero_drm_resource_create(struct pipe_screen *ps,
+-- 
+2.44.1
+

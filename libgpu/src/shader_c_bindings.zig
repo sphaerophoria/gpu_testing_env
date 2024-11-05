@@ -272,6 +272,17 @@ pub export fn  libgpu_shader_push_command_iadd(shader: *ShaderBuilder, id: u32, 
     return true;
 }
 
+pub export fn libgpu_shader_push_tex_sample(shader: *ShaderBuilder, id: u32, src: u32) bool {
+    shader.pushCommand(.{
+        .sample_tex = .{
+            .output = id,
+            .src = src,
+        },
+    }) catch return false;
+    return true;
+
+}
+
 pub export fn libgpu_compile_shader(shader: *ShaderBuilder, data_opt: ?**anyopaque, len_opt: ?*usize) bool {
     const ret = shader.compile() catch return false;
     const data = data_opt orelse return false;
