@@ -84,7 +84,7 @@ qemu: $(QEMU_SRC)
 	cd build/qemu && $(CURDIR)/$(QEMU_SRC)/configure
 	ninja -C build/qemu qemu-system-x86_64
 
-mesa:
+mesa: $(MESA_SRC)
 	mkdir -p build/mesa
 	PATH="$(CURDIR)/build/buildroot/host/bin/:$(CURDIR)/buildroot/host/sbin:$(PATH)" PYTHONNOUSERSITE=y meson setup --prefix=/usr --libdir=lib --default-library=shared --buildtype=debug --cross-file=$(CURDIR)/cross-compilation.conf -Db_pie=false -Db_staticpic=true -Dstrip=false -Dbuild.pkg_config_path=$(CURDIR)/build/buildroot/host/lib/pkgconfig -Dbuild.cmake_prefix_path=$(CURDIR)/build/buildroot/host/lib/cmake -Dgallium-omx=disabled -Dpower8=disabled -Ddri3=enabled -Dllvm=disabled -Dgallium-opencl=disabled -Dglx=dri -Dglx-direct=true -Dgallium-xa=disabled -Dshared-glapi=enabled -Dgallium-drivers=swrast,virgl -Dgallium-extra-hud=true -Dvulkan-drivers= -Dosmesa=false -Dopengl=true -Dgallium-va=disabled -Dplatforms=x11,wayland -Dgbm=enabled -Degl=enabled -Dgles1=enabled -Dgles2=enabled -Dvalgrind=disabled -Dlibunwind=disabled -Dgallium-vdpau=disabled -Dlmsensors=disabled -Dzstd=disabled -Dglvnd=false $(CURDIR)/src/mesa-24.0.9/ $(CURDIR)/build/mesa/
 	PATH="$(CURDIR)/build/buildroot/host/bin/:$(CURDIR)/buildroot/host/sbin:$(PATH)" ninja -C $(CURDIR)/build/mesa
